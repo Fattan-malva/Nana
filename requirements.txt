@@ -1,0 +1,5 @@
+pyaudio==0.2.14
+numpy==2.2.6
+httpx==0.27.0
+python-dotenv==1.0.1
+SpeechRecognition==3.14.3
