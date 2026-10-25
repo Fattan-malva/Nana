@@ -13,7 +13,7 @@ aplikasi, terminal, UI Automation, serta browser atas nama user.
 | Speech-to-text | `SpeechRecognition` (`recognize_google`, bahasa Indonesia) |
 | Reasoning | Ollama OpenAI-compatible API (`OLLAMA_URL`) |
 | Aksi desktop | `ctypes`, `pywinauto`, `psutil` |
-| Browser | Playwright + CDP attach/takeover + UI Automation fallback |
+| Browser | UI Automation + keyboard pada browser user |
 | Web realtime | Ollama Web Search API + fallback DuckDuckGo |
 
 Tidak ada server FastAPI, template, atau static asset terpisah. Seluruh UI
@@ -51,7 +51,7 @@ Nana/
 │   └── ollama.py           # web search/fetch API Ollama + fallback DDG
 └── tools/
     ├── __init__.py
-    ├── browser.py          # Playwright + UIA untuk tab/klik/cari/play
+    ├── browser.py          # UI Automation untuk tab/klik/cari/play
     ├── desktop.py          # app, window, folder, terminal, volume
     ├── interaction.py      # klik/ketik kontrol UIA, mouse
     ├── keyboard.py         # input keyboard via ctypes
@@ -66,9 +66,11 @@ Nana/
 
 Cache runtime tidak disimpan di folder source:
 
-* Profil browser Nana: `%LOCALAPPDATA%\Nana\browser`
 * Cache mapping aplikasi: `%LOCALAPPDATA%\Nana\apps_map.json`
 * Rekaman sementara STT: `temp.wav` di folder kerja (dihapus saat keluar)
+
+Nana tidak menyimpan profil browser sendiri. Semua tugas browser memakai
+profil, login, dan history browser milik user.
 
 ## Instalasi
 
@@ -81,8 +83,9 @@ Copy-Item .env.example .env
 python app.py
 ```
 
-Playwright memakai Edge/Brave/Chrome yang sudah terpasang. Jika tidak ada
-browser Chromium sama sekali, jalankan `python -m playwright install chromium`.
+Kontrol browser memakai UI Automation + keyboard pada window browser user. Tidak
+ada dependency browser automation tambahan. Pastikan Brave/Chrome/Edge/Firefox
+sudah terpasang dan pernah dipakai user.
 
 ## Environment Variables
 
@@ -106,11 +109,11 @@ Agent dan tool:
 
 Browser:
 
-* `NANA_BROWSER` — `brave` / `msedge` / `chrome` (kosong = deteksi otomatis)
-* `NANA_BROWSER_PROFILE` — folder profil (default `%LOCALAPPDATA%\Nana\browser`)
-* `NANA_CDP_PORTS` — port CDP browser user (default `9222,9223,9333`; `0` = nonaktif)
-* `NANA_BROWSER_HEADLESS` — `true` untuk browser tak terlihat
-* `NANA_BROWSER_TIMEOUT` — timeout operasi browser dalam detik (default 20)
+* `NANA_BROWSER` — opsional: `brave` / `chrome` / `edge` / `firefox` / `vivaldi` / `opera`.
+  Kosong = browser default Windows yang sedang dipakai user.
+
+Tidak ada profil browser Nana, port debug, atau mode headless: browser selalu
+browser user yang tampil dengan profil/history asli.
 
 Web realtime:
 
@@ -147,8 +150,16 @@ UI Automation & verifikasi:
 
 ## Browser Automation
 
-Nana memakai Playwright dengan browser Chromium yang benar-benar terpasang
-(Brave/Edge/Chrome), bukan browser tiruan.
+Nana memakai browser milik user, lengkap dengan profil, login, dan history.
+Tidak ada browser/profil terpisah untuk Nana.
+
+Mode kontrol: UI Automation pada window browser user + keyboard. Nana memakai
+pohon aksesibilitas Windows untuk membaca halaman, tab, tombol, dan link.
+Tidak perlu restart browser dan tidak mengubah profil.
+
+Saat belum ada browser terbuka, Nana membuka browser default Windows (atau
+browser yang disebut user, mis. Brave) dengan profil normal user. Tugas browser
+selalu menambah tab baru di browser itu.
 
 * Buka halaman: `browser_open`
 * Cari lewat kolom pencarian situs (bukan URL `?q=`): `browser_search`
@@ -156,37 +167,29 @@ Nana memakai Playwright dengan browser Chromium yang benar-benar terpasang
 * Lihat kondisi nyata halaman: `browser_state`, `browser_find`
 * Aksi: `browser_click`, `browser_fill`, `browser_press`, `browser_scroll`, `browser_wait`
 * Tab: `browser_tabs`, `browser_switch_tab`, `browser_close_tab`
-* Ambil alih browser user yang sedang terbuka: `browser_attach`
+* Pastikan browser user aktif: `browser_attach`
 
 Aturan tab:
 
-* `browser_tabs` memisahkan **Browser Nana** / **Browser user (CDP penuh)**
-  dan **Browser lain (UIA)**.
-* Tab hanya ditutup/dipilih kalau judul/URL-nya cocok. Kalau tidak ada yang
-  cocok, Nana melaporkan daftar tab yang tersedia, bukan menutup tab sembarangan.
-* Untuk tab di browser user yang belum terhubung penuh, isi `browser: "user"`.
+* `browser_tabs` menampilkan tab browser user yang benar-benar terbaca. Tidak ada
+  browser Nana terpisah.
+* Tab hanya ditutup/dipilih kalau judulnya cocok. Judul wajib untuk menutup tab;
+  kalau tidak ada yang cocok, Nana melaporkan daftar tab yang tersedia, bukan
+  menutup tab sembarangan.
 * URL mesin pencari (`?q=`, `/results?search_query=`, dll.) diblokir; Nana
   harus mengetik di kolom pencarian asli situs.
 
-### Mengambil alih browser user
+### Memilih browser
 
-Nana bisa mengendalikan browser yang sedang user pakai, lengkap dengan tab
-dan login yang sudah ada:
+Kalau user menyebut browser tertentu, isi `browser` pada tool, misalnya:
 
-1. `browser_attach` tanpa restart mencoba attach lewat CDP. Ini langsung
-   berhasil kalau browser user sudah dibuka dengan port debug.
-2. Kalau belum, Nana menjelaskan bahwa browser perlu ditutup dan dibuka ulang
-   sekali. Setelah user setuju, panggil:
-   `browser_attach(browser="brave", restart=true, confirm=true)`.
-3. Nana menutup window browser target secara graceful, membukanya lagi dengan
-   `--remote-debugging-port` (port kosong dari `NANA_CDP_PORTS`) dan
-   `--restore-last-session`, lalu attach.
-4. Setelah terhubung, semua tool browser memakai browser user itu. Tab
-   incognito tidak bisa dipulihkan.
+```json
+{"tool":"browser_open","args":{"url":"https://www.youtube.com","browser":"brave"}}
+```
 
-Profil Nana tetap tersedia untuk tugas yang tidak boleh mengganggu browser
-user. Sekali saja, login ke Spotify/YouTube di jendela browser Nana supaya
-pemutaran penuh bisa berjalan tanpa mengambil alih browser user.
+Kalau tidak disebut, Nana memakai browser default Windows yang sedang terbuka.
+Browser yang sudah terbuka tidak ditutup, tidak di-restart, dan tidak diganti
+profilnya.
 
 ## Realtime Web
 

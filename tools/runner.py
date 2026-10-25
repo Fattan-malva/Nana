@@ -97,15 +97,16 @@ def _call(name, args):
                 "supaya Nana mengetik di kolom pencarian asli situs itu."
             )
         try:
-            return browser.open_url(url)
+            return browser.open_url(url, new_tab=True)
         except browser.BrowserError:
             desktop.open_url(url)
             return f"{url} dibuka (browser default)"
 
     if name == "browser_open":
         url = _text(args, "url")
-        new_tab = _bool(args, "new_tab")
-        return browser.open_url(url, new_tab=new_tab)
+        new_tab = _bool(args, "new_tab", True)
+        browser_name = _text(args, "browser", required=False) or None
+        return browser.open_url(url, new_tab=new_tab, browser_name=browser_name)
 
     if name == "browser_tabs":
         return browser.list_tabs_text()
@@ -121,9 +122,7 @@ def _call(name, args):
 
     if name == "browser_attach":
         browser_name = _text(args, "browser", required=False) or None
-        restart = _bool(args, "restart")
-        confirm = _bool(args, "confirm")
-        return browser.attach_user(browser_name, restart=restart, confirm=confirm)
+        return browser.attach_user(browser_name)
 
     if name == "browser_state":
         return browser.state_text()
@@ -160,12 +159,14 @@ def _call(name, args):
     if name == "browser_search":
         query = _text(args, "query")
         site = _text(args, "site", required=False) or None
-        return browser.search_on_site(query, site=site)
+        browser_name = _text(args, "browser", required=False) or None
+        return browser.search_on_site(query, site=site, browser_name=browser_name)
 
     if name == "browser_play":
         service = _text(args, "service", required=False) or "youtube"
         query = _text(args, "query")
-        return browser.play(service, query)
+        browser_name = _text(args, "browser", required=False) or None
+        return browser.play(service, query, browser_name=browser_name)
 
     if name == "web_search":
         query = _text(args, "query")
@@ -354,11 +355,9 @@ def status(tool, args):
     if name == "browser_switch_tab":
         return "focus", f"Pindah ke tab {arg('title', '')[:40]}"
     if name == "browser_close_tab" or name == "close_tab":
-        return "blocked", f"Menutup tab {arg('title', 'aktif')[:40]}"
+        return "blocked", f"Menutup tab {arg('title', '')[:40]}"
     if name == "browser_attach":
-        if str(a.get("restart") or "").strip().lower() in ("1", "true", "yes", "on", "ya"):
-            return "globe", "Membuka ulang browser user"
-        return "globe", "Menghubungkan browser user"
+        return "globe", "Memakai browser user"
     if name == "browser_state":
         return "list", "Membaca halaman"
     if name == "browser_find":

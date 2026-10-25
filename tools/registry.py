@@ -76,38 +76,39 @@ TOOLS = {
 
     # --- browser dinamis ---------------------------------------------------
     "browser_open": {
-        "args": {"url": "string", "new_tab": "boolean (opsional)"},
+        "args": {
+            "url": "string",
+            "new_tab": "boolean (opsional, default true)",
+            "browser": "string (opsional: auto|brave|chrome|edge|firefox|vivaldi|opera)",
+        },
         "desc": (
-            "Buka URL di browser yang dikendalikan Nana. Pakai ini (bukan open_url) "
-            "kalau setelah membuka situs masih perlu klik/ketik."
+            "Buka URL sebagai tab baru di browser user yang sudah terbuka (profil, login, history user). "
+            "Kalau belum ada browser, buka browser default Windows. Jangan memakai profil browser Nana. "
+            "Pakai ini (bukan open_url) kalau setelah membuka situs masih perlu klik/ketik."
         ),
     },
     "browser_tabs": {
         "args": {},
-        "desc": "Lihat semua tab browser yang terbuka (judul, URL, mana yang aktif). Panggil dulu sebelum menutup/memilih tab.",
+        "desc": "Lihat semua tab browser user yang terbuka (judul dan mana yang aktif). Panggil dulu sebelum menutup/memilih tab.",
     },
     "browser_switch_tab": {
-        "args": {"title": "string", "browser": "string (opsional: auto|nana|user)"},
-        "desc": "Pindah ke tab yang judulnya paling cocok. Isi browser='user' untuk tab milik browser user.",
+        "args": {"title": "string"},
+        "desc": "Pindah ke tab browser user yang judulnya paling cocok. Jangan menebak; panggil browser_tabs dulu.",
     },
     "browser_close_tab": {
-        "args": {"title": "string (opsional)", "browser": "string (opsional: auto|nana|user)"},
+        "args": {"title": "string"},
         "desc": (
-            "Tutup tab browser yang judul/URL-nya cocok dengan title. "
-            "Kalau title tidak diberikan, tutup tab aktif. Tidak akan menebak tab lain. "
-            "Isi browser='user' kalau tab ada di daftar 'Browser user' dari browser_tabs."
+            "Tutup tab browser user yang judulnya cocok dengan title. Judul wajib; "
+            "Nana tidak menebak dan tidak menutup tab aktif tanpa judul."
         ),
     },
     "browser_attach": {
         "args": {
-            "browser": "string (opsional: brave|chrome|edge)",
-            "restart": "boolean (opsional)",
-            "confirm": "boolean (opsional)",
+            "browser": "string (opsional: auto|brave|chrome|edge|firefox|vivaldi|opera)",
         },
         "desc": (
-            "Hubungkan Nana ke browser user yang sedang terbuka. Tanpa restart hanya berhasil "
-            "kalau browser sudah membuka port debug CDP. restart=true menutup & membuka ulang "
-            "browser dengan tab dipulihkan; wajib confirm=true dan izin user."
+            "Gunakan browser user yang sedang terbuka dengan profil/history-nya lewat "
+            "UI Automation. Tidak menutup/me-restart browser dan tidak membuka profil Nana."
         ),
     },
     "browser_state": {
@@ -119,20 +120,19 @@ TOOLS = {
         "desc": "Cari elemen di halaman berdasarkan teks/label (mis. 'Search', 'Play', judul lagu).",
     },
     "browser_click": {
-        "args": {"target": "string (opsional)", "selector": "string (opsional)"},
+        "args": {"target": "string"},
         "desc": (
-            "Klik elemen berdasarkan teks/label yang terlihat. Bisa juga pakai CSS selector, "
-            "mis. selector='#search' atau target='css=#search'."
+            "Klik elemen berdasarkan teks/label yang terlihat. CSS selector tidak dipakai; "
+            "sebutkan teks tombol/link yang ada di halaman."
         ),
     },
     "browser_fill": {
         "args": {
             "target": "string (opsional)",
-            "selector": "string (opsional)",
             "text": "string",
             "submit": "boolean (opsional)",
         },
-        "desc": "Isi kolom input berdasarkan label/CSS selector, lalu tekan Enter jika submit=true (default true).",
+        "desc": "Isi kolom input berdasarkan label, lalu tekan Enter jika submit=true (default true).",
     },
     "browser_press": {
         "args": {"key": "string"},
@@ -140,23 +140,31 @@ TOOLS = {
     },
     "browser_scroll": {
         "args": {"direction": "string", "amount": "number (opsional)"},
-        "desc": "Scroll halaman aktif: up/down/left/right.",
+        "desc": "Scroll halaman aktif ke atas atau ke bawah.",
     },
     "browser_wait": {
         "args": {"target": "string", "timeout": "number (opsional)"},
-        "desc": "Tunggu sampai teks atau CSS selector (target='css=...') muncul di halaman.",
+        "desc": "Tunggu sampai teks yang terlihat muncul di halaman.",
     },
     "browser_search": {
-        "args": {"query": "string", "site": "string (opsional)"},
+        "args": {
+            "query": "string",
+            "site": "string (opsional)",
+            "browser": "string (opsional: auto|brave|chrome|edge|firefox|vivaldi|opera)",
+        },
         "desc": (
             "Cari DI DALAM sebuah situs dengan menemukan kolom pencarian situs itu "
-            "(bukan URL ?q=). Contoh site: youtube, tokopedia, github, atau URL lengkap."
+            "(bukan URL ?q=), di tab baru browser user. Contoh site: youtube, tokopedia, github."
         ),
     },
     "browser_play": {
-        "args": {"service": "string", "query": "string"},
+        "args": {
+            "service": "string",
+            "query": "string",
+            "browser": "string (opsional: auto|brave|chrome|edge|firefox|vivaldi|opera)",
+        },
         "desc": (
-            "Cari lalu putar lagu/video dan verifikasi benar-benar berputar. "
+            "Cari lalu putar lagu/video di browser user dan verifikasi benar-benar berputar. "
             "service: youtube, spotify, youtube music, atau situs lain. "
             "query: judul lagu/video yang diinginkan."
         ),
@@ -165,15 +173,15 @@ TOOLS = {
     # --- browser lama (dipertahankan) -------------------------------------
     "open_url": {
         "args": {"url": "string"},
-        "desc": "Buka URL http/https lewat browser Nana (fallback ke browser default). Untuk tugas yang perlu interaksi lanjut, pakai browser_open.",
+        "desc": "Buka URL http/https di browser user/default (bukan profil Nana). Untuk tugas yang perlu interaksi lanjut, pakai browser_open.",
     },
     "close_tab": {
-        "args": {"title": "string (opsional)", "count": "number (opsional)", "browser": "string (opsional: auto|nana|user)"},
-        "desc": "Alias lama untuk browser_close_tab. Tutup tab yang cocok dengan title, bukan tab sembarangan.",
+        "args": {"title": "string", "count": "number (opsional)"},
+        "desc": "Alias lama untuk browser_close_tab. Judul wajib dan harus cocok dengan tab yang ada.",
     },
     "close_browser": {
         "args": {"title": "string (opsional)"},
-        "desc": "Tutup seluruh window browser.",
+        "desc": "Tutup window browser tertentu hanya jika user secara eksplisit memintanya.",
     },
 
     # --- observasi & verifikasi -------------------------------------------
@@ -255,14 +263,17 @@ def system_prompt(extra_context: str = ""):
         "5. Jangan pernah menampilkan JSON mentah ke user.\n\n"
 
         "ATURAN PENTING:\n"
+        "- Browser Nana SELALU browser milik user: profil, login, dan history yang sudah ada. "
+        "Jangan pernah membuka profil browser terpisah atau meminta user restart browser.\n"
+        "- Kalau user tidak menyebut browser, pakai browser default Windows yang sedang terbuka. "
+        "Kalau user menyebut Brave/Chrome/Edge/Firefox secara eksplisit, isi browser='brave'/'chrome'/'edge'/'firefox'.\n"
+        "- Tugas browser membuka TAB BARU di browser user yang sudah terbuka. Jangan menutup atau "
+        "me-restart browser user.\n"
         "- Jangan menebak. Sebelum menutup atau memilih tab, panggil browser_tabs dulu, lalu pakai judul "
         "yang benar-benar ada di daftar. Jangan pernah menutup tab yang tidak diminta. "
-        "browser_tabs memisahkan 'Browser Nana'/'Browser user (CDP penuh)' dan 'Browser lain (UIA)'; "
-        "kalau tab ada di Browser lain, isi browser='user'.\n"
-        "- Kalau user minta mengendalikan browser yang sedang dia pakai (bukan browser Nana), panggil "
-        "browser_attach dulu. Kalau hasilnya bilang port debug belum aktif, jelaskan bahwa browser harus "
-        "ditutup & dibuka ulang sekali; minta izin user, lalu panggil browser_attach(restart=true, "
-        "confirm=true, browser=...). Jangan pernah restart browser tanpa izin.\n"
+        "browser_tabs menampilkan tab browser user; tidak ada browser Nana terpisah.\n"
+        "- browser_attach hanya untuk memastikan Nana memakai browser user. Kontrol dilakukan lewat "
+        "UI Automation pada teks/label yang terlihat. Jangan meminta restart browser.\n"
         "- JANGAN memakai URL pencarian (mis. google.com/search?q=... atau youtube.com/results?search_query=...). "
         "Gunakan browser_search supaya Nana menemukan kolom pencarian situs itu dan mengetik di sana.\n"
         "- Untuk memutar musik/video, panggil browser_play(service, query). Itu sudah mencakup: buka situs, "
@@ -281,7 +292,8 @@ def system_prompt(extra_context: str = ""):
         'User: "putar lagu lofi di youtube" -> {"tool":"browser_play","args":{"service":"youtube","query":"lofi instrumental"}}\n'
         'User: "cari sepatu running di tokopedia" -> {"tool":"browser_search","args":{"site":"tokopedia","query":"sepatu running"}}\n'
         'User: "tutup tab spotify" -> {"tool":"browser_tabs","args":{}}\n'
-        'User: "pakai browser Brave saya yang sedang terbuka" -> {"tool":"browser_attach","args":{}}\n'
+        'User: "pakai browser Brave saya yang sedang terbuka" -> {"tool":"browser_attach","args":{"browser":"brave"}}\n'
+        'User: "buka youtube di Brave" -> {"tool":"browser_open","args":{"url":"https://www.youtube.com","browser":"brave"}}\n'
         'User: "harga bitcoin hari ini" -> {"tool":"web_search","args":{"query":"harga bitcoin hari ini"}}\n\n'
 
         f"DAFTAR TOOL:\n{tools}"
