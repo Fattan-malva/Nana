@@ -119,6 +119,12 @@ def _call(name, args):
         source = _text(args, "browser", required=False) or "auto"
         return browser.close_tab(title, source=source)
 
+    if name == "browser_attach":
+        browser_name = _text(args, "browser", required=False) or None
+        restart = _bool(args, "restart")
+        confirm = _bool(args, "confirm")
+        return browser.attach_user(browser_name, restart=restart, confirm=confirm)
+
     if name == "browser_state":
         return browser.state_text()
 
@@ -349,6 +355,10 @@ def status(tool, args):
         return "focus", f"Pindah ke tab {arg('title', '')[:40]}"
     if name == "browser_close_tab" or name == "close_tab":
         return "blocked", f"Menutup tab {arg('title', 'aktif')[:40]}"
+    if name == "browser_attach":
+        if str(a.get("restart") or "").strip().lower() in ("1", "true", "yes", "on", "ya"):
+            return "globe", "Membuka ulang browser user"
+        return "globe", "Menghubungkan browser user"
     if name == "browser_state":
         return "list", "Membaca halaman"
     if name == "browser_find":

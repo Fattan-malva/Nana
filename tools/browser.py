@@ -4,7 +4,9 @@ Dua lapis:
 
 1. Chromium lewat Playwright (utama) — DOM asli, tab, kolom pencarian,
    klik hasil, verifikasi pemutaran. Browser yang dipakai:
-   - attach ke browser user kalau ada CDP port terbuka, atau
+   - attach ke browser user kalau ada CDP port terbuka,
+   - ambil alih browser user (restart graceful + session restore) lewat
+     browser_attach(restart=true), atau
    - browser khusus Nana (profil sendiri, login tersimpan).
 2. Windows UI Automation + keyboard (fallback) — untuk tab di browser
    milik user yang tidak bisa di-attach.
@@ -17,12 +19,18 @@ import difflib
 import os
 import re
 import shutil
+import socket
+import subprocess
 import threading
 import time
 from urllib.parse import urlparse
 
 
 class BrowserError(Exception):
+    pass
+
+
+class AmbiguousTab(BrowserError):
     pass
 
 
@@ -96,6 +104,21 @@ SITES = {
 }
 
 CHROMIUM_PROCESSES = ("brave.exe", "msedge.exe", "chrome.exe", "vivaldi.exe", "opera.exe", "firefox.exe")
+_FAMILY_BY_PROCESS = {
+    "brave.exe": "brave",
+    "chrome.exe": "chrome",
+    "msedge.exe": "edge",
+    "vivaldi.exe": "vivaldi",
+    "opera.exe": "opera",
+    "firefox.exe": "firefox",
+}
+_USER_DATA_DIR = {
+    "brave": r"BraveSoftware\Brave-Browser\User Data",
+    "chrome": r"Google\Chrome\User Data",
+    "edge": r"Microsoft\Edge\User Data",
+    "vivaldi": r"Vivaldi\User Data",
+}
+_CDP_BROWSERS = ("brave", "chrome", "edge", "vivaldi")
 
 # URL hasil "search engine" klasik. Nana sengaja menolak ini supaya selalu
 # mengetik di kolom pencarian asli situs (bukan mengarang URL ?q=...).
@@ -114,6 +137,8 @@ _pw = None
 _browser = None
 _context = None
 _owned = False
+_attached_endpoint = None  # endpoint CDP yang sedang dipakai
+_cdp_endpoint = None  # endpoint yang dipilih untuk attach ke browser user
 
 _last_page = None  # tab terakhir yang disentuh Nana (headless: semua tab "visible")
 
@@ -135,7 +160,7 @@ def _is_dead_error(exc) -> bool:
 
 
 def _reset():
-    global _pw, _browser, _context, _owned, _last_page
+    global _pw, _browser, _context, _owned, _attached_endpoint, _last_page
     with _lock:
         # Jangan pernah menutup browser milik user; cukup lepaskan koneksi.
         try:
@@ -147,6 +172,7 @@ def _reset():
         _browser = None
         _context = None
         _owned = False
+        _attached_endpoint = None
         _last_page = None
 
 
@@ -229,23 +255,64 @@ def _find_chromium():
     return None, "edge"
 
 
-def _probe_cdp():
+def _check_cdp(endpoint, family=None):
+    """Kembalikan endpoint CDP kalau benar-benar hidup, selain itu None."""
     import httpx
 
-    for port in CDP_PORTS:
-        try:
-            resp = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=0.7)
-            if resp.status_code == 200:
-                info = resp.json()
-                if info.get("webSocketDebuggerUrl"):
-                    return f"http://127.0.0.1:{port}"
-        except Exception:
-            continue
+    base = str(endpoint or "").rstrip("/")
+    if not base:
+        return None
+    try:
+        resp = httpx.get(f"{base}/json/version", timeout=0.7)
+        if resp.status_code != 200:
+            return None
+        info = resp.json()
+        if not info.get("webSocketDebuggerUrl"):
+            return None
+        if family:
+            ua = f"{info.get('Browser') or ''} {info.get('User-Agent') or ''}".lower()
+            detected = ""
+            if "brave" in ua:
+                detected = "brave"
+            elif "edg/" in ua or "edge" in ua:
+                detected = "edge"
+            elif "vivaldi" in ua:
+                detected = "vivaldi"
+            elif "chrome" in ua:
+                detected = "chrome"
+            if detected and detected != family:
+                return None
+        return base
+    except Exception:
+        pass
     return None
 
 
-def _ensure_context():
-    global _pw, _browser, _context, _owned
+def _probe_cdp(exclude_owned=False, family=None):
+    global _cdp_endpoint
+
+    owned_port = f"http://127.0.0.1:{DEBUG_PORT}"
+    if _cdp_endpoint:
+        if exclude_owned and _cdp_endpoint == owned_port:
+            pass
+        else:
+            found = _check_cdp(_cdp_endpoint, family=family)
+            if found:
+                return found
+            _cdp_endpoint = None
+
+    for port in CDP_PORTS:
+        endpoint = f"http://127.0.0.1:{port}"
+        if exclude_owned and endpoint == owned_port:
+            continue
+        found = _check_cdp(endpoint, family=family)
+        if found:
+            return found
+    return None
+
+
+def _ensure_context(launch=True):
+    global _pw, _browser, _context, _owned, _attached_endpoint
     with _lock:
         if _context is not None:
             try:
@@ -274,13 +341,19 @@ def _ensure_context():
                 _browser = _pw.chromium.connect_over_cdp(endpoint)
                 _context = _browser.contexts[0] if _browser.contexts else _browser.new_context()
                 _owned = False
-                print(f"[browser] attach ke browser user di {endpoint}")
+                _attached_endpoint = endpoint
+                print(f"[browser] attach ke browser CDP di {endpoint}")
             except Exception as e:
                 errors.append(f"attach: {e}")
                 _browser = None
                 _context = None
 
         if _context is None:
+            if not launch:
+                _reset()
+                raise BrowserError(
+                    "tidak bisa attach ke browser CDP: " + " | ".join(errors or ["endpoint tidak merespons"])
+                )
             exe, family = _find_chromium()
             launch_args = [
                 "--start-maximized",
@@ -310,6 +383,7 @@ def _ensure_context():
                             profile, executable_path=exe, **kwargs
                         )
                     _owned = True
+                    _attached_endpoint = None
                     print(f"[browser] membuka browser {family or 'edge'} ({profile})")
                     break
                 except Exception as e:
@@ -355,6 +429,19 @@ def _session_running() -> bool:
         return True
     except Exception:
         return False
+
+
+def _ensure_if_available() -> bool:
+    """Attach ke browser CDP yang sudah terbuka tanpa membuka browser baru."""
+    if _session_running():
+        return True
+    if _probe_cdp():
+        try:
+            _ensure_context(launch=False)
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def _active_page():
@@ -634,17 +721,47 @@ def _find(page, target, action="focus", value=""):
 # ------------------------------------------------------------------------ UI Automation
 
 
-def _window_process(hwnd):
+def _pid_for_window(hwnd):
     try:
         import ctypes
         from ctypes import wintypes
-        import psutil
 
         pid = wintypes.DWORD()
         ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
-        return psutil.Process(pid.value).name().lower()
+        return int(pid.value or 0)
     except Exception:
-        return ""
+        return 0
+
+
+def _window_owner(hwnd):
+    try:
+        import ctypes
+
+        return int(ctypes.windll.user32.GetWindow(int(hwnd), 4) or 0)  # GW_OWNER
+    except Exception:
+        return 0
+
+
+def _process_details(pid):
+    details = {"pid": int(pid or 0), "process": "", "exe": "", "cmdline": []}
+    if not pid:
+        return details
+    try:
+        import psutil
+
+        proc = psutil.Process(int(pid))
+        details["process"] = proc.name().lower()
+        try:
+            details["exe"] = proc.exe() or ""
+        except Exception:
+            pass
+        try:
+            details["cmdline"] = proc.cmdline() or []
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return details
 
 
 def _browser_windows():
@@ -654,11 +771,39 @@ def _browser_windows():
         return []
     windows = []
     for win in desktop.list_windows():
-        proc = _window_process(win["hwnd"])
+        hwnd = int(win["hwnd"])
+        if _window_owner(hwnd):
+            continue  # popup/dialog milik browser, bukan window utama
+        details = _process_details(_pid_for_window(hwnd))
+        proc = details["process"]
         # Wajib berdasarkan proses: VS Code juga memakai class Chrome_WidgetWin_1.
         if proc in CHROMIUM_PROCESSES:
-            windows.append(win)
+            item = dict(win)
+            item.update(details)
+            item["family"] = _FAMILY_BY_PROCESS.get(proc, "")
+            windows.append(item)
     return windows
+
+
+def _rect_parts(control):
+    try:
+        r = control.rectangle()
+        return (int(r.left), int(r.top), int(r.right), int(r.bottom))
+    except Exception:
+        return None
+
+
+def _tab_strip_item(control, win_rect, max_top=150):
+    """TabItem harus berada di tab strip atas, bukan konten web."""
+    rect = _rect_parts(control)
+    if rect is None:
+        return True
+    left, top, right, bottom = rect
+    if top > win_rect[1] + max_top:
+        return False
+    if bottom - top > 110:
+        return False
+    return True
 
 
 def _uia_tabs(hwnd):
@@ -666,24 +811,51 @@ def _uia_tabs(hwnd):
         from pywinauto import Desktop as PwDesktop
 
         win = PwDesktop(backend="uia").window(handle=int(hwnd))
-        tabs = []
-        # Jalur cepat: tab strip biasanya kontrol "Tab" dengan anak TabItem.
+        win_rect = _rect_parts(win)
+        if win_rect is None:
+            win_rect = (0, 0, 1920, 1080)
+        win_width = max(1, win_rect[2] - win_rect[0])
+
+        # Jalur cepat: pilih kontrol Tab paling atas yang lebar (tab strip),
+        # bukan Tab milik konten web seperti sidebar WhatsApp.
+        strips = []
         try:
-            strip = win.child_window(control_type="Tab", found_index=0)
-            for control in strip.children():
+            for strip in win.descendants(control_type="Tab", depth=8):
+                rect = _rect_parts(strip)
+                if rect is None:
+                    continue
+                width = max(0, rect[2] - rect[0])
+                if rect[1] > win_rect[1] + 150 or width < win_width * 0.4:
+                    continue
+                strips.append((rect[1], strip))
+        except Exception:
+            strips = []
+        strips.sort(key=lambda item: item[0])
+
+        for _top, strip in strips:
+            tabs = []
+            try:
+                children = strip.children()
+            except Exception:
+                continue
+            for control in children:
                 try:
+                    if str(control.element_info.control_type).lower() != "tabitem":
+                        continue
                     name = _clean_tab_name(control.window_text())
-                    if name:
+                    if name and _tab_strip_item(control, win_rect):
                         tabs.append((name, control))
                 except Exception:
                     continue
             if tabs:
                 return tabs
-        except Exception:
-            pass
-        # Fallback: telusuri descendant dengan kedalaman terbatas.
+
+        # Fallback: hanya TabItem di area atas jendela.
+        tabs = []
         for control in win.descendants(control_type="TabItem", depth=8):
             try:
+                if not _tab_strip_item(control, win_rect):
+                    continue
                 name = _clean_tab_name(control.window_text())
                 if name:
                     tabs.append((name, control))
@@ -697,6 +869,9 @@ def _uia_tabs(hwnd):
 def _uia_all_tabs():
     result = []
     for win in _browser_windows()[:6]:
+        udd = _cmdline_value(win.get("cmdline"), "--user-data-dir") or _default_user_data_dir(win.get("family") or "")
+        if _is_nana_profile(udd):
+            continue  # tab browser Nana ditangani Playwright, bukan UIA
         for name, control in _uia_tabs(win["hwnd"]):
             result.append({"window": win["title"], "hwnd": win["hwnd"], "title": name, "control": control})
     return result
@@ -704,13 +879,25 @@ def _uia_all_tabs():
 
 def _uia_find_tab(needle):
     needle = str(needle or "")
-    best = None
-    best_score = 0
-    for tab in _uia_all_tabs():
+    matches = []
+    for index, tab in enumerate(_uia_all_tabs()):
         score = _fuzzy_score(tab["title"], needle)
-        if score > best_score:
-            best, best_score = tab, score
-    return best if best_score >= 60 else None
+        if score >= 60:
+            matches.append((score, index, tab))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    top = matches[0][0]
+    ties = [item for item in matches if item[0] >= top - 4]
+    if len(ties) > 1:
+        listing = "\n".join(
+            f"- {tab['title']} (window: {tab['window']})" for _, _, tab in ties[:8]
+        )
+        raise AmbiguousTab(
+            f"'{needle}' cocok dengan beberapa tab user:\n{listing}\n"
+            "Sebutkan judul yang lebih spesifik."
+        )
+    return matches[0][2]
 
 
 def _uia_focus(tab):
@@ -750,6 +937,347 @@ def _uia_activate_tab(needle):
     return tab["title"]
 
 
+# ------------------------------------------------------- browser user takeover
+
+
+def _default_user_data_dir(family):
+    rel = _USER_DATA_DIR.get(_normalize(family))
+    if not rel:
+        return ""
+    root = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return os.path.join(root, rel)
+
+
+def _nana_profile_dirs():
+    return {
+        os.path.normcase(os.path.normpath(PROFILE_DIR)),
+        os.path.normcase(os.path.normpath(PROFILE_DIR + "-alt")),
+    }
+
+
+def _is_nana_profile(user_data_dir):
+    path = str(user_data_dir or "").strip()
+    if not path:
+        return False
+    return os.path.normcase(os.path.normpath(path)) in _nana_profile_dirs()
+
+
+def _cmdline_value(cmdline, flag):
+    """Ambil nilai argumen Chrome seperti --user-data-dir=... ."""
+    args = [str(a).strip().strip('"') for a in (cmdline or [])]
+    flag = flag.lower()
+    for index, arg in enumerate(args):
+        low = arg.lower()
+        if low.startswith(flag + "="):
+            return arg.split("=", 1)[1].strip('"')
+        if low == flag and index + 1 < len(args):
+            return args[index + 1].strip('"')
+    return ""
+
+
+def _user_browser_groups():
+    """Kelompokkan window browser user berdasarkan family + profil."""
+    groups = {}
+    for win in _browser_windows():
+        family = win.get("family") or ""
+        if family not in _CDP_BROWSERS:
+            continue
+        udd = _cmdline_value(win.get("cmdline"), "--user-data-dir") or _default_user_data_dir(family)
+        if _is_nana_profile(udd):
+            continue  # jangan pernah menganggap profil Nana sebagai browser user
+        profile = _cmdline_value(win.get("cmdline"), "--profile-directory") or "Default"
+        key = (family, os.path.normcase(os.path.normpath(udd)), profile.lower())
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "family": family,
+                "user_data_dir": udd,
+                "profile": profile,
+                "exe": win.get("exe") or "",
+                "windows": [],
+            }
+            groups[key] = group
+        if not group["exe"] and win.get("exe"):
+            group["exe"] = win["exe"]
+        group["windows"].append(win)
+    return list(groups.values())
+
+
+def _group_label(group):
+    names = {"brave": "Brave", "chrome": "Chrome", "edge": "Edge", "vivaldi": "Vivaldi"}
+    name = names.get(group.get("family"), group.get("family") or "Browser")
+    return f"{name} (profil {group.get('profile') or 'Default'})"
+
+
+def _group_tab_titles(group):
+    titles = []
+    seen = set()
+    for win in group.get("windows") or []:
+        for name, _control in _uia_tabs(win["hwnd"]):
+            key = _normalize(name)
+            if key and key not in seen:
+                seen.add(key)
+                titles.append(name)
+    return titles
+
+
+def _browser_family(name):
+    value = _normalize(name or "")
+    aliases = {
+        "brave": "brave",
+        "brave browser": "brave",
+        "chrome": "chrome",
+        "google chrome": "chrome",
+        "edge": "edge",
+        "msedge": "edge",
+        "microsoft edge": "edge",
+        "vivaldi": "vivaldi",
+    }
+    if value in ("", "auto", "otomatis", "any"):
+        return ""
+    return aliases.get(value, value)
+
+
+def _pick_user_browser(browser=None):
+    groups = _user_browser_groups()
+    if not groups:
+        raise BrowserError(
+            "tidak ada browser Chromium (Brave/Chrome/Edge) yang sedang terbuka. "
+            "Firefox belum mendukung kontrol penuh lewat CDP."
+        )
+
+    wanted = _browser_family(browser)
+    if wanted:
+        groups = [g for g in groups if g["family"] == wanted]
+        if not groups:
+            available = ", ".join(sorted({g["family"] for g in _user_browser_groups()}))
+            raise BrowserError(
+                f"browser '{browser}' tidak sedang terbuka. Yang terdeteksi: {available or '(tidak ada)'}"
+            )
+
+    if len(groups) == 1:
+        return groups[0]
+
+    # Utamakan window browser yang sedang fokus, jangan menebak profil lain.
+    try:
+        from . import desktop
+
+        foreground = int(desktop.foreground_info().get("hwnd") or 0)
+    except Exception:
+        foreground = 0
+    for group in groups:
+        if any(int(w.get("hwnd") or 0) == foreground for w in group["windows"]):
+            return group
+
+    listing = "; ".join(
+        f"{_group_label(g)}: {', '.join(w['title'] for w in g['windows'][:3])}"
+        for g in groups
+    )
+    raise BrowserError(
+        f"ada beberapa browser/profil terbuka ({listing}). Sebutkan browser=brave/chrome/edge "
+        "atau fokuskan window yang ingin dipakai."
+    )
+
+
+def _close_browser_group(group, timeout=12):
+    """Tutup graceful window browser target; jangan pernah force-kill."""
+    import ctypes
+
+    hwnds = {int(w["hwnd"]) for w in group.get("windows") or [] if w.get("hwnd")}
+    if not hwnds:
+        raise BrowserError("window browser target tidak ditemukan")
+
+    for hwnd in hwnds:
+        try:
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:
+            pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            from . import desktop
+
+            visible = {int(w["hwnd"]) for w in desktop.list_windows()}
+        except Exception:
+            visible = set()
+        if not (hwnds & visible):
+            time.sleep(0.7)
+            return
+        time.sleep(0.4)
+
+    raise BrowserError(
+        "browser belum mau tertutup (mungkin ada dialog konfirmasi atau tab yang belum disimpan). "
+        "Tutup browser itu manual, lalu jalankan browser_attach lagi."
+    )
+
+
+def _port_free(port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", int(port)))
+            return True
+    except OSError:
+        return False
+
+
+def _takeover_port():
+    seen = set()
+    candidates = [p for p in CDP_PORTS if p] + [9222, 9223, 9333, 9224, 9225]
+    for port in candidates:
+        if port in seen:
+            continue
+        seen.add(port)
+        if _port_free(port):
+            return port
+    raise BrowserError(
+        "tidak ada port debug yang kosong. Tutup aplikasi yang memakai port 9222/9223/9333, "
+        "lalu coba lagi."
+    )
+
+
+def _wait_cdp(port, timeout=30):
+    endpoint = f"http://127.0.0.1:{int(port)}"
+    deadline = time.time() + max(3, int(timeout))
+    while time.time() < deadline:
+        found = _check_cdp(endpoint)
+        if found:
+            return found
+        time.sleep(0.5)
+    return None
+
+
+def _launch_browser_group(group, port):
+    exe = group.get("exe") or ""
+    if not exe or not os.path.isfile(exe):
+        found, family = _find_chromium()
+        exe = found if family == group.get("family") else ""
+    if not exe or not os.path.isfile(exe):
+        raise BrowserError(f"executable {group.get('family') or 'browser'} tidak ditemukan")
+
+    args = [
+        exe,
+        f"--remote-debugging-port={int(port)}",
+        "--restore-last-session",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--user-data-dir={group.get('user_data_dir') or _default_user_data_dir(group.get('family'))}",
+    ]
+    profile = str(group.get("profile") or "").strip()
+    if profile:
+        args.append(f"--profile-directory={profile}")
+    try:
+        subprocess.Popen(args, close_fds=True)
+    except Exception as e:
+        raise BrowserError(f"gagal membuka ulang browser: {str(e).splitlines()[0]}") from e
+
+
+def attach_user(browser_name=None, restart=False, confirm=False):
+    """Hubungkan Nana ke browser user yang sedang terbuka.
+
+    Tanpa restart: hanya attach kalau browser sudah membuka port CDP.
+    Dengan restart: tutup window target secara graceful, buka ulang dengan
+    port debug + session restore, lalu attach. Wajib confirm=True.
+    """
+    global _cdp_endpoint
+
+    wanted = _browser_family(browser_name)
+    endpoint = _probe_cdp(exclude_owned=True, family=wanted or None)
+    if endpoint:
+        if _session_running():
+            if _owned:
+                stop_browser()
+            else:
+                _reset()
+        _cdp_endpoint = endpoint
+        try:
+            _ensure_context(launch=False)
+            time.sleep(0.6)
+            pages = _pages()
+        except Exception:
+            _cdp_endpoint = None
+            raise
+        label = "browser user"
+        try:
+            if pages:
+                current = _active_page()
+                label = f"{current.title()} — {current.url}"
+        except Exception:
+            pass
+        return (
+            f"Terhubung penuh ke browser user via CDP ({endpoint}).\n"
+            f"Tab terbaca: {len(pages)}. Aktif: {label}\n"
+            "Semua tool browser sekarang memakai browser user ini."
+        )
+
+    group = _pick_user_browser(browser_name)
+    label = _group_label(group)
+    tabs = _group_tab_titles(group)
+
+    if not restart:
+        lines = [
+            f"Belum terhubung penuh: {label} tidak membuka port debug CDP.",
+            f"Tab yang terlihat via UI Automation: {len(tabs)}",
+        ]
+        if tabs:
+            lines.append("  " + " | ".join(tabs[:8]))
+        lines.extend(
+            [
+                "Kontrol tab masih bisa lewat browser_tabs/browser_switch_tab/browser_close_tab (UIA), "
+                "tapi klik/isi/cari/play butuh CDP.",
+                "Minta izin user, lalu panggil browser_attach(browser=..., restart=true, confirm=true). "
+                "Browser akan ditutup dan dibuka ulang dengan session restore.",
+            ]
+        )
+        return "\n".join(lines)
+
+    if not confirm:
+        raise BrowserError(
+            "restart browser butuh izin user. Jelaskan bahwa browser akan ditutup dan dibuka ulang, "
+            "lalu panggil browser_attach(restart=true, confirm=true) setelah user setuju."
+        )
+
+    if _session_running():
+        if _owned:
+            stop_browser()
+        else:
+            _reset()
+
+    _close_browser_group(group)
+    port = _takeover_port()
+    _launch_browser_group(group, port)
+    endpoint = _wait_cdp(port, 30)
+    if not endpoint:
+        raise BrowserError(
+            f"{label} sudah dibuka ulang, tapi port debug {port} belum aktif. "
+            "Tutup browser itu lalu jalankan browser_attach lagi; kalau tetap gagal, "
+            "buka browser secara manual dengan --remote-debugging-port."
+        )
+
+    _cdp_endpoint = endpoint
+    try:
+        _ensure_context(launch=False)
+        time.sleep(1.2)
+        pages = _pages()
+    except Exception:
+        _cdp_endpoint = None
+        raise
+
+    try:
+        titles = [page.title() for page in pages][:8]
+    except Exception:
+        titles = []
+    lines = [
+        f"Browser user diambil alih: {label}",
+        f"Browser ditutup & dibuka ulang dengan port debug {port}; session dipulihkan.",
+        f"Terhubung penuh. Tab terbaca: {len(pages)}"
+        + (f" — {' | '.join(titles)}" if titles else ""),
+        "Catatan: tab incognito tidak bisa dipulihkan.",
+    ]
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------- tab helpers
 
 
@@ -762,17 +1290,39 @@ def _page_score(page, needle):
     return max(_fuzzy_score(title, needle), _fuzzy_score(url, needle))
 
 
-def _best_page(pages, needle):
-    best = None
-    best_score = 0
-    for page in pages:
+def _page_matches(pages, needle):
+    items = []
+    for index, page in enumerate(pages):
         try:
             score = _page_score(page, needle)
         except Exception:
             continue
-        if score > best_score:
-            best, best_score = page, score
-    return best if best_score >= 55 else None
+        if score > 0:
+            items.append((score, index, page))
+    items.sort(key=lambda item: (-item[0], item[1]))
+    return items
+
+
+def _page_label(page):
+    try:
+        return f"{page.title()} — {page.url}"
+    except Exception:
+        return "(tab tidak bisa dibaca)"
+
+
+def _best_page(pages, needle):
+    items = _page_matches(pages, needle)
+    if not items or items[0][0] < 55:
+        return None
+    top = items[0][0]
+    ties = [item for item in items if item[0] >= max(55, top - 4)]
+    if len(ties) > 1:
+        listing = "\n".join(f"- {_page_label(item[2])}" for item in ties[:8])
+        raise AmbiguousTab(
+            f"'{needle}' cocok dengan beberapa tab:\n{listing}\n"
+            "Sebutkan judul atau URL yang lebih spesifik."
+        )
+    return items[0][2]
 
 
 def _tab_line(index, page, active=False):
@@ -782,11 +1332,42 @@ def _tab_line(index, page, active=False):
         return f"{index}. (tab tidak bisa dibaca)"
 
 
+def _title_seen(title, managed_titles):
+    """True kalau judul window browser sudah terwakili tab yang dibaca via CDP."""
+    low = _normalize(title)
+    if not low:
+        return True
+    for managed in managed_titles:
+        if not managed:
+            continue
+        if managed in low or low in managed:
+            return True
+        if _fuzzy_score(title, managed) >= 75:
+            return True
+    return False
+
+
+def _session_label():
+    if _owned:
+        return "Browser Nana (bisa dikendalikan penuh):"
+    if _attached_endpoint and _attached_endpoint.rstrip("/").endswith(f":{DEBUG_PORT}"):
+        return "Browser Nana (profil Nana, terhubung ulang):"
+    return "Browser user (terhubung penuh via CDP):"
+
+
 @_recoverable
 def list_tabs_text():
-    lines = ["Browser Nana (bisa dikendalikan penuh):"]
-    managed_titles = set()
+    if not _session_running():
+        endpoint = _probe_cdp()
+        if endpoint:
+            try:
+                _ensure_context(launch=False)
+            except Exception:
+                pass
+
     if _session_running():
+        lines = [_session_label()]
+        managed_titles = set()
         try:
             pages = _pages()
         except Exception as e:
@@ -803,30 +1384,33 @@ def list_tabs_text():
                 managed_titles.add(_normalize(page.title()))
             except Exception:
                 pass
-        if not pages and len(lines) == 1:
+        if not pages:
             lines.append("  (belum ada tab)")
     else:
-        lines.append("  (belum aktif; akan dibuka saat dibutuhkan)")
+        lines = ["Browser Nana (belum aktif; akan dibuka saat dibutuhkan):"]
+        managed_titles = set()
 
     other_windows = []
     for win in _browser_windows()[:5]:
         title = win["title"].strip()
-        if not title or _normalize(title) in managed_titles:
-            continue  # ini jendela browser Nana sendiri
-        tabs = [name for name, _ in _uia_tabs(win["hwnd"])][:25]
+        if _title_seen(title, managed_titles):
+            continue  # ini jendela browser Nana sendiri / sudah terbaca via CDP
+        tabs = [
+            name
+            for name, _ in _uia_tabs(win["hwnd"])
+            if _normalize(name) not in managed_titles
+        ][:25]
         if not tabs:
             continue
         other_windows.append((title, tabs))
 
     if other_windows:
         lines.append("")
-        lines.append("Browser user (kontrol terbatas via UI Automation):")
+        lines.append("Browser lain (kontrol terbatas via UI Automation):")
         for win_title, tabs in other_windows:
             lines.append(f"  Window: {win_title}")
             for name in tabs:
                 lines.append(f"    - {name}")
-    if len(lines) == 1:
-        lines.append("  (tidak ada tab browser)")
     return "\n".join(lines)
 
 
@@ -836,6 +1420,8 @@ def activate_tab(title, source="auto"):
     src = _normalize(source or "auto")
     if not needle:
         raise BrowserError("judul tab kosong")
+    if src in ("auto", "nana", "otomatis"):
+        _ensure_if_available()
     if src in ("auto", "nana", "otomatis") and _session_running():
         page = _best_page(_pages(), needle)
         if page is not None:
@@ -863,10 +1449,14 @@ def close_tab(title=None, count=1, source="auto"):
         amount = max(1, min(10, int(count or 1)))
     except (TypeError, ValueError):
         amount = 1
+    if src in ("auto", "nana", "otomatis"):
+        _ensure_if_available()
+    if src in ("nana", "otomatis") and not _session_running():
+        raise BrowserError(f"browser Nana belum aktif atau tidak ada tab.\n{list_tabs_text()}")
 
     closed = []
-    for index in range(amount):
-        target = needle if index == 0 else ""
+    for _ in range(amount):
+        target = needle if needle else ""
         result = None
         error = None
 
@@ -879,7 +1469,7 @@ def close_tab(title=None, count=1, source="auto"):
                         raise BrowserError(f"tab '{target}' tidak ada di browser Nana")
                 else:
                     page = _active_page()
-                closed_title = page.title()
+                closed_title = _page_label(page)
                 before = len(pages)
                 try:
                     page.close(run_before_unload=False)
@@ -889,6 +1479,8 @@ def close_tab(title=None, count=1, source="auto"):
                 if len(_pages()) >= before:
                     raise BrowserError("tab tidak mau tertutup")
                 result = closed_title or "(tanpa judul)"
+            except AmbiguousTab as e:
+                raise BrowserError(f"{e}\n{list_tabs_text()}") from e
             except Exception as e:
                 error = e
                 if src in ("nana", "otomatis"):
@@ -923,6 +1515,8 @@ def close_tab(title=None, count=1, source="auto"):
                         "judul tab kosong. Sebutkan tab yang mau ditutup "
                         "(lihat daftar dari browser_tabs)."
                     )
+            except AmbiguousTab as e:
+                raise BrowserError(f"{e}\n{list_tabs_text()}") from e
             except Exception as e:
                 if error is None:
                     error = e
@@ -1818,14 +2412,13 @@ def play(service, query):
 
 @_recoverable
 def stop_browser():
-    global _pw, _browser, _context, _owned
+    global _pw, _browser, _context, _owned, _attached_endpoint
     if not _session_running():
+        _reset()
         return "Browser otomatis sedang tidak aktif"
     if not _owned:
-        raise BrowserError(
-            "Nana menempel ke browser milik user; menutup seluruhnya tidak diizinkan. "
-            "Gunakan browser_close_tab atau close_browser."
-        )
+        _reset()
+        return "Koneksi ke browser user dilepas (browser tetap terbuka)"
     try:
         _context.close()
     finally:

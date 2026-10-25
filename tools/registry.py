@@ -98,6 +98,18 @@ TOOLS = {
             "Isi browser='user' kalau tab ada di daftar 'Browser user' dari browser_tabs."
         ),
     },
+    "browser_attach": {
+        "args": {
+            "browser": "string (opsional: brave|chrome|edge)",
+            "restart": "boolean (opsional)",
+            "confirm": "boolean (opsional)",
+        },
+        "desc": (
+            "Hubungkan Nana ke browser user yang sedang terbuka. Tanpa restart hanya berhasil "
+            "kalau browser sudah membuka port debug CDP. restart=true menutup & membuka ulang "
+            "browser dengan tab dipulihkan; wajib confirm=true dan izin user."
+        ),
+    },
     "browser_state": {
         "args": {},
         "desc": "Baca kondisi halaman aktif: URL, judul, kolom input, tombol, link, status media, dan teks.",
@@ -245,8 +257,12 @@ def system_prompt(extra_context: str = ""):
         "ATURAN PENTING:\n"
         "- Jangan menebak. Sebelum menutup atau memilih tab, panggil browser_tabs dulu, lalu pakai judul "
         "yang benar-benar ada di daftar. Jangan pernah menutup tab yang tidak diminta. "
-        "browser_tabs memisahkan 'Browser Nana' dan 'Browser user'; kalau tab ada di Browser user, "
-        "isi browser='user'.\n"
+        "browser_tabs memisahkan 'Browser Nana'/'Browser user (CDP penuh)' dan 'Browser lain (UIA)'; "
+        "kalau tab ada di Browser lain, isi browser='user'.\n"
+        "- Kalau user minta mengendalikan browser yang sedang dia pakai (bukan browser Nana), panggil "
+        "browser_attach dulu. Kalau hasilnya bilang port debug belum aktif, jelaskan bahwa browser harus "
+        "ditutup & dibuka ulang sekali; minta izin user, lalu panggil browser_attach(restart=true, "
+        "confirm=true, browser=...). Jangan pernah restart browser tanpa izin.\n"
         "- JANGAN memakai URL pencarian (mis. google.com/search?q=... atau youtube.com/results?search_query=...). "
         "Gunakan browser_search supaya Nana menemukan kolom pencarian situs itu dan mengetik di sana.\n"
         "- Untuk memutar musik/video, panggil browser_play(service, query). Itu sudah mencakup: buka situs, "
@@ -265,6 +281,7 @@ def system_prompt(extra_context: str = ""):
         'User: "putar lagu lofi di youtube" -> {"tool":"browser_play","args":{"service":"youtube","query":"lofi instrumental"}}\n'
         'User: "cari sepatu running di tokopedia" -> {"tool":"browser_search","args":{"site":"tokopedia","query":"sepatu running"}}\n'
         'User: "tutup tab spotify" -> {"tool":"browser_tabs","args":{}}\n'
+        'User: "pakai browser Brave saya yang sedang terbuka" -> {"tool":"browser_attach","args":{}}\n'
         'User: "harga bitcoin hari ini" -> {"tool":"web_search","args":{"query":"harga bitcoin hari ini"}}\n\n'
 
         f"DAFTAR TOOL:\n{tools}"
