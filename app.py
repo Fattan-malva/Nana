@@ -1,6 +1,16 @@
 import os
 os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
 
+import sys
+
+# Console Windows kadang memakai cp1252; tanpa ini, print teks Unicode
+# (judul lagu, em dash, emoji) bisa melempar UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import re
 import wave
@@ -16,7 +26,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from tools import runner  # noqa: E402  (setelah .env dimuat)
+from tools import browser, runner, web  # noqa: E402  (setelah .env dimuat)
+from tools.registry import system_prompt  # noqa: E402
 from core.task_engine import TaskEngine, is_cancelled, reset_cancel  # noqa: E402
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ollama.com/v1/chat/completions")
@@ -31,9 +42,9 @@ TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 try:
-    TOOLS_MAX_STEPS = max(0, min(8, int(os.getenv("TOOLS_MAX_STEPS", "4") or 4)))
+    TOOLS_MAX_STEPS = max(0, min(25, int(os.getenv("TOOLS_MAX_STEPS", "8") or 8)))
 except ValueError:
-    TOOLS_MAX_STEPS = 4
+    TOOLS_MAX_STEPS = 8
 
 # --- Mode tidur: berapa detik tanpa pertanyaan sebelum NANA tidur (0 = nonaktif) ---
 try:
@@ -1232,7 +1243,14 @@ class Api:
             self._js(f"window.appendAnswer({json.dumps(text)})")
 
     def _messages_for(self, text):
-        messages = [{"role": "system", "content": runner.system_prompt()}]
+        # Info realtime (berita/harga/cuaca/dll) disuntikkan otomatis kalau
+        # pertanyaannya butuh data terbaru dan laptop punya akses internet.
+        try:
+            extra = web.realtime_context(text)
+        except Exception as e:
+            print(f"[web] context dilewati: {type(e).__name__}: {e}")
+            extra = ""
+        messages = [{"role": "system", "content": system_prompt(extra)}]
         messages.extend(self._history[-8:])
         messages.append({"role": "user", "content": text})
         return messages
@@ -1396,6 +1414,9 @@ class Api:
         self._current_task = self._task_engine.create(message)
         self._task_engine.set_plan(self._current_task.task_id, [])
 
+        last_signature = None
+        repeat_count = 0
+
         for step in range(TOOLS_MAX_STEPS + 1):
             if is_cancelled():
                 msg = "Tugas dibatalkan."
@@ -1415,6 +1436,24 @@ class Api:
 
             tool = action.get("tool")
             args = action.get("args") or {}
+            tool_name = re.sub(r"\s*\([^)]*\)\s*$", "", str(tool or "").strip())
+
+            # Cegah loop: aksi yang benar-benar sama tidak dijalankan 3x.
+            signature = f"{tool_name}|{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+            if signature == last_signature:
+                repeat_count += 1
+            else:
+                last_signature = signature
+                repeat_count = 1
+            if repeat_count >= 3:
+                msg = (
+                    "Aksi yang sama sudah diulang tiga kali, jadi Nana hentikan. "
+                    "Coba beri perintah yang lebih spesifik atau satu langkah saja ya."
+                )
+                self._emit(msg)
+                emitted_any = True
+                final_text += msg
+                break
 
             if not TOOLS_ENABLED:
                 msg = "Maaf, kontrol komputer sedang dimatikan (TOOLS_ENABLED=false)."
@@ -1433,8 +1472,6 @@ class Api:
             icon, label = runner.status(tool, args)
             print(f"[tool] rencana: {tool} {json.dumps(args, ensure_ascii=False)[:200]}")
             self._js(f"window.showAction({json.dumps(icon)}, {json.dumps(label)})")
-
-            tool_name = re.sub(r"\s*\([^)]*\)\s*$", "", str(tool or "").strip())
 
             if tool_name == "type_text" and self._terminal_guard:
                 result = {
@@ -1469,6 +1506,19 @@ class Api:
                 f"{json.dumps(done_label)})"
             )
 
+            remaining = max(0, TOOLS_MAX_STEPS - step - 1)
+            guidance = (
+                "Lanjutkan: kalau masih perlu aksi lain, balas JSON tool berikutnya. "
+                "Kalau sudah selesai, jawab user dengan bahasa Indonesia singkat. "
+                "Jangan tampilkan JSON ke user."
+            )
+            if not result.get("ok"):
+                guidance = (
+                    "Hasil ini GAGAL/BLOK. Jangan mengklaim berhasil. "
+                    "Pilih strategi lain yang aman (mis. browser_state/browser_tabs "
+                    "untuk melihat kondisi nyata) atau jelaskan kendalanya ke user. "
+                    "Jangan mengulang tool+args yang sama."
+                )
             messages.append(
                 {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
             )
@@ -1476,11 +1526,9 @@ class Api:
                 {
                     "role": "user",
                     "content": (
-                        f"[HASIL TOOL: {tool}]\n"
+                        f"[HASIL TOOL: {tool}] (sisa langkah: {remaining})\n"
                         f"{json.dumps(result, ensure_ascii=False)}\n\n"
-                        "Lanjutkan: kalau masih perlu aksi lain, balas JSON tool berikutnya. "
-                        "Kalau sudah selesai, jawab user dengan bahasa Indonesia singkat. "
-                        "Jangan tampilkan JSON ke user."
+                        f"{guidance}"
                     ),
                 }
             )
@@ -1515,9 +1563,15 @@ if __name__ == "__main__":
         min_size=(SLEEP_WIN_W, SLEEP_WIN_H),
     )
     api.set_window(window)
-    webview.start(lambda: api.start_auto())
-    api.stop_auto()
     try:
-        os.remove("temp.wav")
-    except Exception:
-        pass
+        webview.start(lambda: api.start_auto())
+    finally:
+        api.stop_auto()
+        try:
+            browser.stop_browser()
+        except Exception as e:
+            print(f"[browser] cleanup dilewati: {type(e).__name__}: {e}")
+        try:
+            os.remove("temp.wav")
+        except OSError:
+            pass

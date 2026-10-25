@@ -1,6 +1,9 @@
 """Daftar tool dan prompt sistem untuk LLM."""
 
+import time
+
 TOOLS = {
+    # --- aplikasi & sistem -------------------------------------------------
     "open_app": {
         "args": {"name": "string"},
         "desc": "Buka aplikasi Windows: vscode, notepad, explorer, calc, chrome, edge, terminal, cmd, dll.",
@@ -13,23 +16,22 @@ TOOLS = {
         "args": {"title": "string"},
         "desc": "Fokus ke jendela yang judulnya mengandung title.",
     },
+    "list_windows": {
+        "args": {},
+        "desc": "Lihat daftar jendela yang sedang terbuka.",
+    },
     "type_text": {
         "args": {"text": "string"},
         "desc": "Ketik teks di jendela aktif. Hanya untuk editor/aplikasi, bukan terminal.",
     },
     "press_key": {
         "args": {"keys": "string"},
-        "desc": "Tekan tombol/kombinasi: enter, tab, esc, ctrl+s, ctrl+shift+s. Delete/Backspace dilarang.",
+        "desc": "Tekan tombol/kombinasi di aplikasi aktif: enter, tab, esc, ctrl+s. Delete/Backspace dilarang.",
     },
     "run_command": {
         "args": {"command": "string", "cwd": "string (opsional)"},
         "desc": "Jalankan perintah terminal singkat dari allowlist dan ambil output-nya. Wajib untuk semua perintah terminal.",
     },
-    "open_url": {
-        "args": {"url": "string"},
-        "desc": "Buka URL http/https di browser default.",
-    },
-
     "open_folder": {
         "args": {"path": "string"},
         "desc": "Buka folder di Windows Explorer.",
@@ -37,10 +39,6 @@ TOOLS = {
     "open_in_vscode": {
         "args": {"path": "string"},
         "desc": "Buka file/folder di VS Code.",
-    },
-    "list_windows": {
-        "args": {},
-        "desc": "Lihat daftar jendela yang sedang terbuka.",
     },
     "wait": {
         "args": {"ms": "number"},
@@ -58,49 +56,142 @@ TOOLS = {
         "args": {},
         "desc": "Toggle mute volume sistem.",
     },
-    "close_tab": {
-        "args": {"title": "string (opsional)", "count": "number (opsional)"},
-        "desc": "Tutup tab browser (Ctrl+W) count kali; jika title diberikan, pilih tab itu dulu.",
-    },
-    "close_browser": {
-        "args": {"title": "string (opsional)"},
-        "desc": "Tutup window browser (seluruh jendela).",
-    },
-    "search_web": {
-        "args": {"query": "string"},
-        "desc": "Cari di web dan buka hasil pertama (generik, dinamis).",
-    },
     "cancel_task": {
         "args": {},
         "desc": "Batalkan tugas yang sedang berjalan.",
     },
+
+    # --- web realtime ------------------------------------------------------
+    "web_search": {
+        "args": {"query": "string", "max_results": "number (opsional)"},
+        "desc": (
+            "Cari di internet (realtime) dan dapatkan judul, URL, dan cuplikan. "
+            "Wajib untuk berita, harga, cuaca, jadwal, skor, rilis, atau info terbaru."
+        ),
+    },
+    "web_fetch": {
+        "args": {"url": "string"},
+        "desc": "Baca isi lengkap satu halaman web (judul, teks, link) dari URL hasil web_search.",
+    },
+
+    # --- browser dinamis ---------------------------------------------------
+    "browser_open": {
+        "args": {"url": "string", "new_tab": "boolean (opsional)"},
+        "desc": (
+            "Buka URL di browser yang dikendalikan Nana. Pakai ini (bukan open_url) "
+            "kalau setelah membuka situs masih perlu klik/ketik."
+        ),
+    },
+    "browser_tabs": {
+        "args": {},
+        "desc": "Lihat semua tab browser yang terbuka (judul, URL, mana yang aktif). Panggil dulu sebelum menutup/memilih tab.",
+    },
+    "browser_switch_tab": {
+        "args": {"title": "string", "browser": "string (opsional: auto|nana|user)"},
+        "desc": "Pindah ke tab yang judulnya paling cocok. Isi browser='user' untuk tab milik browser user.",
+    },
+    "browser_close_tab": {
+        "args": {"title": "string (opsional)", "browser": "string (opsional: auto|nana|user)"},
+        "desc": (
+            "Tutup tab browser yang judul/URL-nya cocok dengan title. "
+            "Kalau title tidak diberikan, tutup tab aktif. Tidak akan menebak tab lain. "
+            "Isi browser='user' kalau tab ada di daftar 'Browser user' dari browser_tabs."
+        ),
+    },
+    "browser_state": {
+        "args": {},
+        "desc": "Baca kondisi halaman aktif: URL, judul, kolom input, tombol, link, status media, dan teks.",
+    },
+    "browser_find": {
+        "args": {"target": "string"},
+        "desc": "Cari elemen di halaman berdasarkan teks/label (mis. 'Search', 'Play', judul lagu).",
+    },
+    "browser_click": {
+        "args": {"target": "string (opsional)", "selector": "string (opsional)"},
+        "desc": (
+            "Klik elemen berdasarkan teks/label yang terlihat. Bisa juga pakai CSS selector, "
+            "mis. selector='#search' atau target='css=#search'."
+        ),
+    },
+    "browser_fill": {
+        "args": {
+            "target": "string (opsional)",
+            "selector": "string (opsional)",
+            "text": "string",
+            "submit": "boolean (opsional)",
+        },
+        "desc": "Isi kolom input berdasarkan label/CSS selector, lalu tekan Enter jika submit=true (default true).",
+    },
+    "browser_press": {
+        "args": {"key": "string"},
+        "desc": "Tekan tombol di halaman: Enter, Escape, Tab, ArrowDown, PageDown, Control+A, dll.",
+    },
+    "browser_scroll": {
+        "args": {"direction": "string", "amount": "number (opsional)"},
+        "desc": "Scroll halaman aktif: up/down/left/right.",
+    },
+    "browser_wait": {
+        "args": {"target": "string", "timeout": "number (opsional)"},
+        "desc": "Tunggu sampai teks atau CSS selector (target='css=...') muncul di halaman.",
+    },
+    "browser_search": {
+        "args": {"query": "string", "site": "string (opsional)"},
+        "desc": (
+            "Cari DI DALAM sebuah situs dengan menemukan kolom pencarian situs itu "
+            "(bukan URL ?q=). Contoh site: youtube, tokopedia, github, atau URL lengkap."
+        ),
+    },
+    "browser_play": {
+        "args": {"service": "string", "query": "string"},
+        "desc": (
+            "Cari lalu putar lagu/video dan verifikasi benar-benar berputar. "
+            "service: youtube, spotify, youtube music, atau situs lain. "
+            "query: judul lagu/video yang diinginkan."
+        ),
+    },
+
+    # --- browser lama (dipertahankan) -------------------------------------
+    "open_url": {
+        "args": {"url": "string"},
+        "desc": "Buka URL http/https lewat browser Nana (fallback ke browser default). Untuk tugas yang perlu interaksi lanjut, pakai browser_open.",
+    },
+    "close_tab": {
+        "args": {"title": "string (opsional)", "count": "number (opsional)", "browser": "string (opsional: auto|nana|user)"},
+        "desc": "Alias lama untuk browser_close_tab. Tutup tab yang cocok dengan title, bukan tab sembarangan.",
+    },
+    "close_browser": {
+        "args": {"title": "string (opsional)"},
+        "desc": "Tutup seluruh window browser.",
+    },
+
+    # --- observasi & verifikasi -------------------------------------------
     "observe_active": {
         "args": {},
         "desc": "Lihat window aktif (judul, class, rect).",
     },
     "ui_controls": {
         "args": {"title": "string (opsional)"},
-        "desc": "Ambil daftar kontrol UI dari window (nama, tipe, auto_id, rect).",
+        "desc": "Ambil daftar kontrol UI Automation dari sebuah window (nama, tipe, auto_id, rect).",
     },
     "ui_click": {
         "args": {"window": "string (opsional)", "name": "string (opsional)", "auto_id": "string (opsional)"},
-        "desc": "Klik kontrol UI berdasarkan nama/auto_id.",
+        "desc": "Klik kontrol UI Automation berdasarkan nama/auto_id (untuk aplikasi desktop, bukan browser).",
     },
     "ui_type": {
         "args": {"window": "string (opsional)", "name": "string (opsional)", "auto_id": "string (opsional)", "text": "string"},
-        "desc": "Isi teks ke kontrol UI.",
+        "desc": "Isi teks ke kontrol UI Automation (aplikasi desktop).",
     },
     "ui_scroll": {
         "args": {"direction": "string"},
-        "desc": "Scroll halaman/aplikasi: up/down/left/right.",
+        "desc": "Scroll aplikasi desktop: up/down/left/right.",
     },
     "mouse_click": {
         "args": {"x": "number", "y": "number"},
-        "desc": "Klik mouse pada koordinat layar (fallback).",
+        "desc": "Klik mouse pada koordinat layar (fallback terakhir).",
     },
     "wait_for_control": {
         "args": {"window": "string (opsional)", "name": "string (opsional)", "auto_id": "string (opsional)", "timeout": "number (opsional)"},
-        "desc": "Tunggu kontrol UI muncul (timeout).",
+        "desc": "Tunggu kontrol UI Automation muncul.",
     },
     "dismiss_dialog": {
         "args": {},
@@ -132,23 +223,52 @@ def tool_lines():
     return lines
 
 
-def system_prompt():
+def system_prompt(extra_context: str = ""):
     tools = "\n".join(tool_lines())
-    return (
-        "Kamu adalah NANA, asisten yang membantu user.\n"
-        "Pengguna bisa mencampur bahasa Indonesia dan Inggris dalam satu kalimat; pahami maksudnya.\n\n"
-        "ATURAN AKSI:\n"
-        "1. Jika user meminta aksi di komputer, balas HANYA satu objek JSON tanpa markdown dan tanpa kalimat lain:\n"
+    now = time.strftime("%A, %d %B %Y — %H:%M")
+    prompt = (
+        "Kamu adalah NANA, AI agent yang mengendalikan laptop Windows milik user.\n"
+        f"Waktu sekarang: {now} (waktu lokal user).\n"
+        "User memakai bahasa Indonesia santai dan kadang mencampur Inggris; pahami maksudnya.\n\n"
+
+        "CARA MENJAWAB:\n"
+        "1. Kalau user hanya mengobrol/bertanya tanpa aksi, jawab biasa tanpa JSON. "
+        "Singkat, maksimal 4 kalimat.\n"
+        "2. Kalau user minta aksi di komputer, balas HANYA SATU objek JSON, tanpa markdown, tanpa kalimat lain:\n"
         '   {"tool":"nama_tool","args":{...}}\n'
-        "2. Satu aksi per balasan. Setelah menerima hasil tool, lanjutkan langkah berikutnya atau jawab user.\n"
-        "3. Jangan pernah menghapus file, folder, atau isi file. Kamu tidak punya tool hapus dan tidak boleh mencari celah.\n"
-        "4. Semua perintah terminal WAJIB lewat run_command. Jangan memakai type_text untuk terminal.\n"
-        "5. type_text hanya untuk mengetik di editor/aplikasi biasa (bukan terminal).\n"
-        "6. Jika aksi ditolak atau dibatasi, jelaskan singkat dan tawarkan alternatif yang aman.\n"
-        "7. Jika tidak perlu aksi, jawab seperti biasa tanpa JSON.\n"
-        "8. Untuk browser, buka URL dengan open_url; interaksi lanjut (ketik/cari/putar) dilakukan di browser yang terbuka memakai type_text/press_key.\n"
-        "9. Untuk pencarian/putar/buka konten apa pun, gunakan search_web (generik) alih-alih membuka search page manual.\n"
-        "9. Untuk permintaan kompleks, lanjutkan langkah demi langkah sampai tujuan selesai; jangan berhenti hanya di pencarian.\n"
-        "10. Jawaban akhir memakai bahasa Indonesia yang santai, singkat (maksimal 4 kalimat), dan jangan pernah menampilkan JSON ke user.\n\n"
+        "3. Setelah tool dijalankan, kamu akan menerima [HASIL TOOL]. Periksa hasilnya, lalu lanjutkan "
+        "ke aksi berikutnya atau jawab user. Satu aksi per balasan.\n"
+        "4. Jangan pernah mengklaim berhasil sebelum ada bukti dari hasil tool. Kalau gagal, coba "
+        "alternatif yang aman atau jelaskan apa adanya.\n"
+        "5. Jangan pernah menampilkan JSON mentah ke user.\n\n"
+
+        "ATURAN PENTING:\n"
+        "- Jangan menebak. Sebelum menutup atau memilih tab, panggil browser_tabs dulu, lalu pakai judul "
+        "yang benar-benar ada di daftar. Jangan pernah menutup tab yang tidak diminta. "
+        "browser_tabs memisahkan 'Browser Nana' dan 'Browser user'; kalau tab ada di Browser user, "
+        "isi browser='user'.\n"
+        "- JANGAN memakai URL pencarian (mis. google.com/search?q=... atau youtube.com/results?search_query=...). "
+        "Gunakan browser_search supaya Nana menemukan kolom pencarian situs itu dan mengetik di sana.\n"
+        "- Untuk memutar musik/video, panggil browser_play(service, query). Itu sudah mencakup: buka situs, "
+        "cari lewat kolom pencarian, pilih hasil, klik, dan verifikasi pemutaran. Jangan berhenti di pencarian.\n"
+        "- Kalau browser_play gagal, periksa dengan browser_state, lalu lanjutkan manual dengan browser_click / "
+        "browser_fill / browser_press. Jangan mengulang tool+args yang sama.\n"
+        "- Untuk info terkini (berita, harga, cuaca, jadwal, skor, rilis, versi terbaru), panggil web_search. "
+        "Kalau butuh detail, panggil web_fetch pada URL hasilnya.\n"
+        "- Setelah aksi browser yang penting, panggil browser_state untuk memastikan hasil nyatanya.\n"
+        "- Untuk aplikasi desktop (bukan web), gunakan observe_active / ui_controls / ui_click / ui_type.\n"
+        "- Jangan menghapus file/folder. Tidak ada tool hapus dan kamu tidak boleh mencari celah.\n"
+        "- Semua perintah terminal WAJIB lewat run_command, bukan type_text.\n"
+        "- Kalau instruksi user ambigu secara material (mis. ada dua tab mirip), tanya dulu.\n\n"
+
+        "CONTOH:\n"
+        'User: "putar lagu lofi di youtube" -> {"tool":"browser_play","args":{"service":"youtube","query":"lofi instrumental"}}\n'
+        'User: "cari sepatu running di tokopedia" -> {"tool":"browser_search","args":{"site":"tokopedia","query":"sepatu running"}}\n'
+        'User: "tutup tab spotify" -> {"tool":"browser_tabs","args":{}}\n'
+        'User: "harga bitcoin hari ini" -> {"tool":"web_search","args":{"query":"harga bitcoin hari ini"}}\n\n'
+
         f"DAFTAR TOOL:\n{tools}"
     )
+    if extra_context:
+        prompt += "\n\n" + extra_context
+    return prompt

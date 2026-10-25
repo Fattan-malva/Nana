@@ -1,6 +1,5 @@
 """Basic task engine for multi-step goals (in-memory)."""
 
-import time
 import uuid
 
 
@@ -12,21 +11,7 @@ class Task:
         self.current_step = 0
         self.completed_steps = []
         self.last_result = None
-        self.retry_count = 0
         self.status = "planning"
-        self.created_at = time.time()
-
-    def to_dict(self):
-        return {
-            "task_id": self.task_id,
-            "goal": self.goal,
-            "plan": self.plan,
-            "current_step": self.current_step,
-            "completed_steps": self.completed_steps,
-            "last_result": self.last_result,
-            "retry_count": self.retry_count,
-            "status": self.status,
-        }
 
 
 # Flag pembatalan global (sederhana).
@@ -54,15 +39,6 @@ class TaskEngine:
     def create(self, goal):
         t = Task(goal)
         self.tasks[t.task_id] = t
-        return t
-
-    def get(self, task_id):
-        return self.tasks.get(task_id)
-
-    def update_status(self, task_id, status):
-        t = self.tasks.get(task_id)
-        if t:
-            t.status = status
         return t
 
     def set_plan(self, task_id, steps):

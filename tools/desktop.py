@@ -2,8 +2,8 @@
 
 Mapping aplikasi dibangun dinamis saat modul dimuat: daftar semua aplikasi
 yang terpasang di laptop user (Start Menu, registry, Get-StartApps) dipindai,
-lalu disimpan ke JSON (apps_map.json). Saat membuka app/terminal/folder,
-hanya yang tersedia secara dinamis yang dipakai. Tersedia juga close_app/close_window."""
+lalu disimpan ke cache di %LOCALAPPDATA%\\Nana\\apps_map.json. Saat membuka
+app/terminal/folder, hanya yang tersedia secara dinamis yang dipakai."""
 
 import ctypes
 import json
@@ -12,8 +12,6 @@ import re
 import shutil
 import subprocess
 import time
-import urllib.parse
-import urllib.request
 from ctypes import wintypes
 
 from . import keyboard, safety
@@ -22,7 +20,6 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 SW_RESTORE = 9
 WM_CLOSE = 0x0010
-CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -68,8 +65,17 @@ class AmbiguousError(DesktopError):
 
 # Tidak ada daftar statis; mapping sepenuhnya dinamis dari aplikasi terpasang.
 
+
+def _cache_dir():
+    """Folder cache milik user, bukan folder source code."""
+    root = os.getenv("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".nana")
+    path = os.path.join(root, "Nana")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 # Path file JSON untuk cache mapping dinamis.
-APPS_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apps_map.json")
+APPS_MAP_PATH = os.path.join(_cache_dir(), "apps_map.json")
 
 # Mapping dinamis: nama ternormalisasi -> target peluncuran (exe path / appid / perintah).
 _dynamic_apps = {}
@@ -463,56 +469,6 @@ def open_url(url):
     return target
 
 
-def _resolve_folder(path):
-    """Resolve path folder secara toleran (case/spasi) ke path yang benar-benar ada."""
-    raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
-    if os.path.isdir(raw):
-        return raw
-
-    # Coba normalisasi spasi (collapse) pada tiap komponen.
-    parts = re.split(r"[\\/]+", raw)
-    norm_parts = [re.sub(r"\s+", " ", p.strip()) for p in parts if p.strip()]
-    cand = os.path.join(*norm_parts) if norm_parts else raw
-    if os.path.isdir(cand):
-        return cand
-
-    # Pencarian fuzzy di root umum untuk nama folder (toleran huruf/spasi).
-    target_name = _normalize(os.path.basename(raw.rstrip("\\/")))
-    if not target_name:
-        return raw
-
-    roots = []
-    home = os.path.expanduser("~")
-    roots.append(home)
-    for sub in ("Desktop", "Documents", "Downloads", "OneDrive", "Pictures", "Music", "Videos"):
-        p = os.path.join(home, sub)
-        if os.path.isdir(p):
-            roots.append(p)
-    # Juga coba parent dari path asli jika ada.
-    parent = os.path.dirname(raw)
-    if os.path.isdir(parent):
-        roots.append(parent)
-
-    matches = []
-    for root in roots:
-        try:
-            for dirpath, dirnames, _ in os.walk(root):
-                depth = dirpath[len(root):].count(os.sep)
-                if depth > 3:
-                    dirnames[:] = []
-                    continue
-                for d in list(dirnames):
-                    if _normalize(d) == target_name or target_name in _normalize(d):
-                        matches.append(os.path.join(dirpath, d))
-        except Exception:
-            continue
-
-    if matches:
-        return min(matches, key=lambda x: (len(x), x))
-
-    return raw
-
-
 def _find_folders(path):
     """Kembalikan list path folder kandidat (fuzzy) untuk input path."""
     raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
@@ -562,26 +518,13 @@ def _find_folders(path):
 
 def open_folder(path):
     raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
-
-    if os.path.isdir(raw):
-        p = raw
-    else:
-        parts = re.split(r"[\\/]+", raw)
-        norm_parts = [re.sub(r"\s+", " ", p.strip()) for p in parts if p.strip()]
-        cand = os.path.join(*norm_parts) if norm_parts else raw
-        if os.path.isdir(cand):
-            p = cand
-        else:
-            matches = _find_folders(raw)
-            if len(matches) > 1:
-                raise AmbiguousError(
-                    f"beberapa folder mirip '{path}': {', '.join(matches[:10])}. Tanyakan pilihan ke user.",
-                    matches[:10],
-                )
-            if len(matches) == 1:
-                p = matches[0]
-            else:
-                p = raw
+    matches = _find_folders(raw)
+    if len(matches) > 1:
+        raise AmbiguousError(
+            f"beberapa folder mirip '{path}': {', '.join(matches[:10])}. Tanyakan pilihan ke user.",
+            matches[:10],
+        )
+    p = matches[0] if matches else raw
 
     p = safety.check_user_path(p)
     if not os.path.isdir(p):
@@ -590,89 +533,22 @@ def open_folder(path):
     return p
 
 
-def close_window(title):
-    needle = str(title or "").strip()
-    if not needle:
-        raise DesktopError("judul window kosong")
-
-    win = _find_window(needle)
-    if not win:
-        raise DesktopError(f"window '{needle}' tidak ditemukan")
-
-    user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
-    return win["title"]
-
-
-def close_tab(title=None, count=1):
-    needle = str(title or "").strip().lower()
-    try:
-        count = int(count)
-    except (TypeError, ValueError):
-        count = 1
-    count = max(1, min(20, count))
-
-    closed = []
-    for i in range(count):
-        browser_wins = []
-        for w in list_windows():
-            t = w["title"].lower()
-            if any(b in t for b in ("chrome", "edge", "firefox", "brave", "opera")):
-                browser_wins.append(w)
-
-        target_win = None
-        if needle and i == 0:
-            for w in browser_wins:
-                if needle in w["title"].lower():
-                    target_win = w
-                    break
-        if target_win is None and browser_wins:
-            target_win = browser_wins[0]
-        if target_win is None:
-            raise DesktopError("window browser tidak ditemukan")
-
-        try:
-            from pywinauto import Desktop as _PwDesktop
-            pw = _PwDesktop(backend="uia").window(handle=target_win["hwnd"])
-            pw.set_focus()
-            time.sleep(0.25)
-            if i == 0 and needle:
-                tabs = [t for t in pw.descendants() if getattr(t.element_info, "control_type", "") == "TabItem"]
-                for t in tabs:
-                    if needle in (t.window_text() or "").lower():
-                        try:
-                            t.select()
-                        except Exception:
-                            try:
-                                t.click_input()
-                            except Exception:
-                                pass
-                        time.sleep(0.4)
-                        break
-            try:
-                pw.set_focus()
-            except Exception:
-                pass
-        except Exception:
-            try:
-                focus_window(target_win["title"])
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-        time.sleep(0.15)
-        keyboard.press_key("ctrl+w")
-        closed.append(target_win["title"])
-        time.sleep(0.8)
-
-    return ", ".join(closed)
-
 def close_browser(title=None):
     needle = str(title or "").strip()
     win = None
     if needle:
         win = _find_window(needle)
     if not win:
-        for cand in ("Google Chrome", "Chrome", "Microsoft Edge", "Edge", "Mozilla Firefox", "Firefox"):
+        for cand in (
+            "Brave",
+            "Brave Browser",
+            "Google Chrome",
+            "Chrome",
+            "Microsoft Edge",
+            "Edge",
+            "Mozilla Firefox",
+            "Firefox",
+        ):
             win = _find_window(cand)
             if win:
                 break
@@ -680,37 +556,6 @@ def close_browser(title=None):
         raise DesktopError("window browser tidak ditemukan")
     user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
     return win["title"]
-
-
-def close_app(name):
-    key = _normalize(name)
-    if not key:
-        raise DesktopError("nama aplikasi kosong")
-
-    # Utamakan menutup window yang cocok (WM_CLOSE, lebih sopan).
-    win = _find_window(name)
-    if win:
-        user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
-        return win["title"]
-
-    # Fallback: taskkill berdasarkan exe dari map dinamis.
-    target = _lookup_app(key)
-    if target:
-        base = os.path.basename(str(target)).lower()
-        if base.endswith(".exe"):
-            try:
-                subprocess.run(
-                    ["taskkill", "/IM", base, "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    creationflags=CREATE_NO_WINDOW,
-                )
-                return base
-            except Exception as e:
-                raise DesktopError(f"gagal menutup {base}: {e}")
-
-    raise DesktopError(f"aplikasi '{name}' tidak ditemukan untuk ditutup")
 
 
 def _vscode_exe():
@@ -777,144 +622,6 @@ def open_terminal(target="vscode"):
     return launched
 
 
-# (dihapus: gunakan browser_open/search manual agar interaktif)
-
-
-# (dihapus: gunakan browser_open/search manual agar interaktif)
-
-
-def _ab_bin():
-    found = shutil.which("agent-browser")
-    if found:
-        return found
-    # Windows: agent-browser.cmd
-    found = shutil.which("agent-browser.cmd")
-    if found:
-        return found
-    return None
-
-
-def _run_ab(args):
-    bin_path = _ab_bin()
-    if not bin_path:
-        raise DesktopError("agent-browser tidak terpasang")
-    try:
-        result = subprocess.run(
-            [bin_path] + list(args),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        out = (result.stdout or "").strip()
-        err = (result.stderr or "").strip()
-        if result.returncode != 0 and not out:
-            raise DesktopError(err or "agent-browser gagal")
-        return out if out else (err or "ok")
-    except subprocess.TimeoutExpired:
-        raise DesktopError("agent-browser timeout")
-    except Exception as e:
-        raise DesktopError(f"agent-browser error: {e}")
-
-
-def browser_open(url):
-    target = str(url or "").strip()
-    if not target.lower().startswith(("http://", "https://")):
-        raise DesktopError("hanya URL http/https yang diizinkan")
-    return _run_ab(["open", target])
-
-
-def browser_snapshot(interactive=True):
-    args = ["snapshot"]
-    if interactive:
-        args.append("-i")
-    return _run_ab(args)
-
-
-def browser_click(ref):
-    r = str(ref or "").strip()
-    if not r:
-        raise DesktopError("ref/selector kosong")
-    return _run_ab(["click", r])
-
-
-def browser_type(ref, text):
-    r = str(ref or "").strip()
-    if not r:
-        raise DesktopError("ref kosong")
-    return _run_ab(["fill", r, str(text or "")])
-
-
-def browser_press(key):
-    k = str(key or "").strip()
-    if not k:
-        raise DesktopError("tombol kosong")
-    return _run_ab(["press", k])
-
-
-def browser_scroll(direction, amount=None):
-    d = str(direction or "").strip().lower()
-    if d not in ("up", "down", "left", "right"):
-        raise DesktopError("arah scroll tidak valid")
-    args = ["scroll", d]
-    if amount is not None:
-        args.append(str(amount))
-    return _run_ab(args)
-
-
-def browser_close():
-    return _run_ab(["close"])
-
-
-def search_web(query):
-    """Cari di web dan buka hasil pertama (generik, dinamis via Google I'm Feeling Lucky)."""
-    q = str(query or "").strip()
-    if not q:
-        raise DesktopError("query kosong")
-    lucky = "https://www.google.com/search?q=%s&btnI=1" % urllib.parse.quote(q)
-    target = lucky
-    try:
-        req = urllib.request.Request(lucky, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            final = resp.geturl()
-            html = resp.read().decode("utf-8", errors="ignore")
-        if final and "google.com/url" in final:
-            m = re.search(r"https?://(?!www\.google\.com)[^\s\"<>]+", html)
-            if m:
-                target = m.group(0)
-        elif "Redirect Notice" in html or "Notifikasi Pengalihan" in html:
-            m = re.search(r"https?://(?!www\.google\.com)[^\s\"<>]+", html)
-            if m:
-                target = m.group(0)
-        else:
-            target = final or lucky
-    except Exception:
-        target = lucky
-    # Reuse tab browser yang sudah terbuka jika ada, agar tidak menambah tab baru.
-    browser_win = None
-    for w in list_windows():
-        t = w["title"].lower()
-        if any(b in t for b in ("chrome", "edge", "firefox", "brave", "opera")):
-            browser_win = w
-            break
-    if browser_win is not None:
-        try:
-            from pywinauto import Desktop as _PwDesktop
-            pw = _PwDesktop(backend="uia").window(handle=browser_win["hwnd"])
-            pw.set_focus()
-            time.sleep(0.3)
-            keyboard.press_key("ctrl+l")
-            time.sleep(0.2)
-            keyboard.type_text(target)
-            time.sleep(0.1)
-            keyboard.press_key("enter")
-            return target
-        except Exception:
-            pass
-    open_url(target)
-    return target
-
-
 def volume_up(steps=1):
     for _ in range(max(1, int(steps))):
         user32.keybd_event(0xAF, 0, 0, 0)
@@ -935,19 +642,6 @@ def volume_mute():
     user32.keybd_event(0xAD, 0, 0, 0)
     user32.keybd_event(0xAD, 0, 2, 0)
     return "mute toggled"
-
-
-def wait_for_window(title, timeout=8.0):
-    needle = str(title or "").strip()
-    if not needle:
-        raise DesktopError("judul window kosong")
-    deadline = time.time() + float(timeout)
-    while time.time() < deadline:
-        win = _find_window(needle)
-        if win:
-            return win["title"]
-        time.sleep(0.3)
-    raise DesktopError(f"window '{needle}' tidak muncul dalam {timeout}s")
 
 
 def wait(ms):
