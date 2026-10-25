@@ -29,6 +29,7 @@ TOOLS = {
         "args": {"url": "string"},
         "desc": "Buka URL http/https di browser default.",
     },
+
     "open_folder": {
         "args": {"path": "string"},
         "desc": "Buka folder di Windows Explorer.",
@@ -72,6 +73,8 @@ def system_prompt():
         "5. type_text hanya untuk mengetik di editor/aplikasi biasa (bukan terminal).\n"
         "6. Jika aksi ditolak atau dibatasi, jelaskan singkat dan tawarkan alternatif yang aman.\n"
         "7. Jika tidak perlu aksi, jawab seperti biasa tanpa JSON.\n"
-        "8. Jawaban akhir memakai bahasa Indonesia yang santai, singkat (maksimal 4 kalimat), dan jangan pernah menampilkan JSON ke user.\n\n"
+        "8. Untuk browser, buka URL dengan open_url; interaksi lanjut (ketik/cari/putar) dilakukan di browser yang terbuka memakai type_text/press_key (mis. YouTube: buka search URL, lalu ketik query & Enter).\n"
+        "9. Untuk permintaan kompleks, lanjutkan langkah demi langkah sampai tujuan selesai; jangan berhenti hanya di pencarian.\n"
+        "10. Jawaban akhir memakai bahasa Indonesia yang santai, singkat (maksimal 4 kalimat), dan jangan pernah menampilkan JSON ke user.\n\n"
         f"DAFTAR TOOL:\n{tools}"
     )

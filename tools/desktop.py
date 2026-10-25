@@ -1,11 +1,19 @@
-"""Aksi desktop Windows: buka app/URL/folder, fokus window, terminal."""
+"""Aksi desktop Windows: buka app/URL/folder, fokus window, terminal.
+
+Mapping aplikasi dibangun dinamis saat modul dimuat: daftar semua aplikasi
+yang terpasang di laptop user (Start Menu, registry, Get-StartApps) dipindai,
+lalu disimpan ke JSON (apps_map.json). Saat membuka app/terminal/folder,
+hanya yang tersedia secara dinamis yang dipakai. Tersedia juga close_app/close_window."""
 
 import ctypes
+import json
 import os
 import re
 import shutil
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 from ctypes import wintypes
 
 from . import keyboard, safety
@@ -13,8 +21,10 @@ from . import keyboard, safety
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 SW_RESTORE = 9
+WM_CLOSE = 0x0010
 CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -48,39 +58,64 @@ class DesktopError(Exception):
     pass
 
 
-APPS = {
-    "vscode": ["code"],
-    "vs code": ["code"],
-    "visual studio code": ["code"],
-    "code": ["code"],
-    "notepad": ["notepad.exe"],
-    "explorer": ["explorer.exe"],
-    "file explorer": ["explorer.exe"],
-    "files": ["explorer.exe"],
-    "calculator": ["calc.exe"],
-    "calc": ["calc.exe"],
-    "chrome": ["chrome.exe"],
-    "google chrome": ["chrome.exe"],
-    "edge": ["msedge.exe"],
-    "microsoft edge": ["msedge.exe"],
-    "task manager": ["taskmgr.exe"],
-    "paint": ["mspaint.exe"],
-    "settings": ["ms-settings:"],
-    "terminal": ["wt.exe"],
-    "windows terminal": ["wt.exe"],
-    "cmd": ["cmd.exe"],
-    "command prompt": ["cmd.exe"],
-    "powershell": ["powershell.exe"],
-}
+class AmbiguousError(DesktopError):
+    """Dilempar saat ada beberapa kandidat mirip (app/folder)."""
 
-TERMINAL_CLASSES = {
-    "ConsoleWindowClass",
-    "CASCADIA_HOSTING_WINDOW_CLASS",
-    "mintty",
-    "PuTTY",
-    "VirtualConsole",
-    "ConsoleWindowClass",
-}
+    def __init__(self, message, candidates):
+        super().__init__(message)
+        self.candidates = list(candidates or [])
+
+
+# Tidak ada daftar statis; mapping sepenuhnya dinamis dari aplikasi terpasang.
+
+# Path file JSON untuk cache mapping dinamis.
+APPS_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apps_map.json")
+
+# Mapping dinamis: nama ternormalisasi -> target peluncuran (exe path / appid / perintah).
+_dynamic_apps = {}
+
+
+def _normalize(name):
+    return re.sub(r"\s+", " ", str(name or "").strip().lower())
+
+
+def _run_ps(script):
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return result.stdout or ""
+    except Exception:
+        return ""
+
+
+def _parse_ps_json(out):
+    out = (out or "").strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        # Coba baris per baris (beberapa cmdlet mengeluarkan banyak objek).
+        items = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                pass
+        return items
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+    return []
 
 
 def _title(hwnd):
@@ -116,11 +151,15 @@ def foreground_info():
     hwnd = user32.GetForegroundWindow()
     title = _title(hwnd) if hwnd else ""
     cls = _class(hwnd) if hwnd else ""
+    terminal_markers = ("console", "terminal", "cmd", "powershell", "mintty", "putty", "cascadia")
+    low_cls = (cls or "").lower()
+    low_title = (title or "").lower()
+    is_terminal = any(m in low_cls or m in low_title for m in terminal_markers)
     return {
         "hwnd": int(hwnd or 0),
         "title": title,
         "class": cls,
-        "is_terminal": cls in TERMINAL_CLASSES,
+        "is_terminal": is_terminal,
     }
 
 
@@ -228,8 +267,155 @@ def _launch(candidates):
     raise last_error or DesktopError("aplikasi tidak ditemukan")
 
 
+def _launch_target(target):
+    """Luncurkan target dinamis (exe path / appid / perintah)."""
+    target = str(target or "").strip()
+    if not target:
+        raise DesktopError("target aplikasi kosong")
+
+    if target.startswith(("http://", "https://", "ms-settings:")):
+        _startfile(target)
+        return target
+
+    # UWP app id (mengandung '!') -> buka via shell:AppsFolder
+    if "!" in target and not os.path.isfile(target):
+        subprocess.Popen(
+            ["explorer.exe", "shell:AppsFolder\\%s" % target],
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return target
+
+    found = shutil.which(target)
+    if found:
+        _startfile(found)
+        return found
+
+    if os.path.isfile(target):
+        _startfile(target)
+        return target
+
+    # Coba sebagai app id generik.
+    if "\\" not in target and not target.lower().endswith(".exe"):
+        try:
+            subprocess.Popen(
+                ["explorer.exe", "shell:AppsFolder\\%s" % target],
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return target
+        except Exception:
+            pass
+
+    _startfile(target)
+    return target
+
+
+def _lookup_app(key):
+    """Cari target di map dinamis (exact lalu fuzzy contains)."""
+    if key in _dynamic_apps:
+        return _dynamic_apps[key]
+    best = None
+    for k, v in _dynamic_apps.items():
+        if key in k or k in key:
+            if best is None or len(k) < len(best[0]):
+                best = (k, v)
+    return best[1] if best else None
+
+
+def _app_candidates(key):
+    """Kembalikan list (nama, target) kandidat mirip untuk key."""
+    if key in _dynamic_apps:
+        return [(key, _dynamic_apps[key])]
+    matches = [(k, v) for k, v in _dynamic_apps.items() if (key in k or k in key)]
+    matches.sort(key=lambda x: (len(x[0]), x[0]))
+    return matches
+
+
+def refresh_app_map():
+    """Pindai aplikasi terpasang di laptop user dan simpan ke JSON."""
+    global _dynamic_apps
+
+    mapping = {}
+
+    # 1) Get-StartApps (Windows 8+): mencakup Win32 + UWP.
+    out = _run_ps("Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Depth 2")
+    for item in _parse_ps_json(out):
+        name = _normalize(item.get("Name", ""))
+        appid = str(item.get("AppID", "")).strip()
+        if name and appid:
+            # Jangan timpa entri yang sudah ada (statis lebih spesifik).
+            mapping.setdefault(name, appid)
+
+    # 2) Shortcut Start Menu -> resolve target exe.
+    shortcut_script = r'''
+$shell = New-Object -ComObject WScript.Shell
+$paths = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs","$env:APPDATA\Microsoft\Windows\Start Menu\Programs")
+$items = @()
+foreach ($p in $paths) {
+  if (Test-Path $p) {
+    Get-ChildItem -Path $p -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+      try {
+        $sc = $shell.CreateShortcut($_.FullName)
+        if ($sc.TargetPath) {
+          $items += [PSCustomObject]@{ Name = $_.BaseName; Target = $sc.TargetPath }
+        }
+      } catch {}
+    }
+  }
+}
+$items | ConvertTo-Json -Depth 2
+'''
+    out = _run_ps(shortcut_script)
+    for item in _parse_ps_json(out):
+        name = _normalize(item.get("Name", ""))
+        target = str(item.get("Target", "")).strip()
+        if name and target:
+            low = target.lower()
+            if low.endswith(".exe") or os.path.isfile(target):
+                # Shortcut lebih langsung -> timpa.
+                mapping[name] = target
+
+    # 3) Registry uninstall -> DisplayIcon exe.
+    registry_script = r'''
+$roots = @(
+ "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+ "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+ "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+$items = @()
+foreach ($r in $roots) {
+  Get-ItemProperty $r -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+    $target = $null
+    if ($_.DisplayIcon) { $target = ($_.DisplayIcon -split ',')[0].Trim().Trim('"') }
+    if ($target -and $target.ToLower().EndsWith('.exe')) {
+      $items += [PSCustomObject]@{ Name = $_.DisplayName; Target = $target }
+    }
+  }
+}
+$items | ConvertTo-Json -Depth 2
+'''
+    out = _run_ps(registry_script)
+    for item in _parse_ps_json(out):
+        name = _normalize(item.get("Name", ""))
+        target = str(item.get("Target", "")).strip()
+        if name and target and target.lower().endswith(".exe"):
+            mapping.setdefault(name, target)
+
+    # Bersihkan entri kosong.
+    mapping = {k: v for k, v in mapping.items() if k and v}
+
+    # Simpan ke JSON.
+    try:
+        with open(APPS_MAP_PATH, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    _dynamic_apps = mapping
+    return mapping
+
+
 def open_app(name):
-    key = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    key = _normalize(name)
     if not key:
         raise DesktopError("nama aplikasi kosong")
 
@@ -242,9 +428,21 @@ def open_app(name):
             _startfile(exe)
             return exe
 
-    candidates = APPS.get(key, [key])
-    launched = _launch(candidates)
-    return launched
+    matches = _app_candidates(key)
+    if not matches:
+        # Fallback terakhir: coba nama mentah sebagai perintah.
+        launched = _launch([key])
+        return launched
+
+    if len(matches) == 1:
+        return _launch_target(matches[0][1])
+
+    # Ambigu: beberapa aplikasi mirip.
+    opts = ", ".join(m[0] for m in matches[:10])
+    raise AmbiguousError(
+        f"beberapa aplikasi mirip '{name}': {opts}. Tanyakan pilihan ke user.",
+        [m[0] for m in matches[:10]],
+    )
 
 
 def open_url(url):
@@ -255,23 +453,192 @@ def open_url(url):
     return target
 
 
+def _resolve_folder(path):
+    """Resolve path folder secara toleran (case/spasi) ke path yang benar-benar ada."""
+    raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
+    if os.path.isdir(raw):
+        return raw
+
+    # Coba normalisasi spasi (collapse) pada tiap komponen.
+    parts = re.split(r"[\\/]+", raw)
+    norm_parts = [re.sub(r"\s+", " ", p.strip()) for p in parts if p.strip()]
+    cand = os.path.join(*norm_parts) if norm_parts else raw
+    if os.path.isdir(cand):
+        return cand
+
+    # Pencarian fuzzy di root umum untuk nama folder (toleran huruf/spasi).
+    target_name = _normalize(os.path.basename(raw.rstrip("\\/")))
+    if not target_name:
+        return raw
+
+    roots = []
+    home = os.path.expanduser("~")
+    roots.append(home)
+    for sub in ("Desktop", "Documents", "Downloads", "OneDrive", "Pictures", "Music", "Videos"):
+        p = os.path.join(home, sub)
+        if os.path.isdir(p):
+            roots.append(p)
+    # Juga coba parent dari path asli jika ada.
+    parent = os.path.dirname(raw)
+    if os.path.isdir(parent):
+        roots.append(parent)
+
+    matches = []
+    for root in roots:
+        try:
+            for dirpath, dirnames, _ in os.walk(root):
+                depth = dirpath[len(root):].count(os.sep)
+                if depth > 3:
+                    dirnames[:] = []
+                    continue
+                for d in list(dirnames):
+                    if _normalize(d) == target_name or target_name in _normalize(d):
+                        matches.append(os.path.join(dirpath, d))
+        except Exception:
+            continue
+
+    if matches:
+        return min(matches, key=lambda x: (len(x), x))
+
+    return raw
+
+
+def _find_folders(path):
+    """Kembalikan list path folder kandidat (fuzzy) untuk input path."""
+    raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
+    if os.path.isdir(raw):
+        return [raw]
+
+    parts = re.split(r"[\\/]+", raw)
+    norm_parts = [re.sub(r"\s+", " ", p.strip()) for p in parts if p.strip()]
+    cand = os.path.join(*norm_parts) if norm_parts else raw
+    if os.path.isdir(cand):
+        return [cand]
+
+    target_name = _normalize(os.path.basename(raw.rstrip("\\/")))
+    if not target_name:
+        return []
+
+    roots = []
+    home = os.path.expanduser("~")
+    roots.append(home)
+    for sub in ("Desktop", "Documents", "Downloads", "OneDrive", "Pictures", "Music", "Videos"):
+        p = os.path.join(home, sub)
+        if os.path.isdir(p):
+            roots.append(p)
+    parent = os.path.dirname(raw)
+    if os.path.isdir(parent):
+        roots.append(parent)
+
+    matches = []
+    seen = set()
+    for root in roots:
+        try:
+            for dirpath, dirnames, _ in os.walk(root):
+                depth = dirpath[len(root):].count(os.sep)
+                if depth > 3:
+                    dirnames[:] = []
+                    continue
+                for d in list(dirnames):
+                    if _normalize(d) == target_name or target_name in _normalize(d):
+                        full = os.path.join(dirpath, d)
+                        if full not in seen:
+                            seen.add(full)
+                            matches.append(full)
+        except Exception:
+            continue
+    return matches
+
+
 def open_folder(path):
-    p = safety.check_user_path(path)
+    raw = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"').strip("'")))
+
+    if os.path.isdir(raw):
+        p = raw
+    else:
+        parts = re.split(r"[\\/]+", raw)
+        norm_parts = [re.sub(r"\s+", " ", p.strip()) for p in parts if p.strip()]
+        cand = os.path.join(*norm_parts) if norm_parts else raw
+        if os.path.isdir(cand):
+            p = cand
+        else:
+            matches = _find_folders(raw)
+            if len(matches) > 1:
+                raise AmbiguousError(
+                    f"beberapa folder mirip '{path}': {', '.join(matches[:10])}. Tanyakan pilihan ke user.",
+                    matches[:10],
+                )
+            if len(matches) == 1:
+                p = matches[0]
+            else:
+                p = raw
+
+    p = safety.check_user_path(p)
     if not os.path.isdir(p):
         raise DesktopError(f"bukan folder: {p}")
     _startfile(p)
     return p
 
 
+def close_window(title):
+    needle = str(title or "").strip()
+    if not needle:
+        raise DesktopError("judul window kosong")
+
+    win = _find_window(needle)
+    if not win:
+        raise DesktopError(f"window '{needle}' tidak ditemukan")
+
+    user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
+    return win["title"]
+
+
+def close_app(name):
+    key = _normalize(name)
+    if not key:
+        raise DesktopError("nama aplikasi kosong")
+
+    # Utamakan menutup window yang cocok (WM_CLOSE, lebih sopan).
+    win = _find_window(name)
+    if win:
+        user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
+        return win["title"]
+
+    # Fallback: taskkill berdasarkan exe dari map dinamis.
+    target = _lookup_app(key)
+    if target:
+        base = os.path.basename(str(target)).lower()
+        if base.endswith(".exe"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/IM", base, "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                return base
+            except Exception as e:
+                raise DesktopError(f"gagal menutup {base}: {e}")
+
+    raise DesktopError(f"aplikasi '{name}' tidak ditemukan untuk ditutup")
+
+
 def _vscode_exe():
-    candidates = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
-        r"C:\Program Files\Microsoft VS Code\Code.exe",
-        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+    # Hanya dari map dinamis + PATH (tanpa path hardcoded).
+    for k in ("visual studio code", "vscode", "vs code", "code"):
+        if k in _dynamic_apps:
+            t = _dynamic_apps[k]
+            if isinstance(t, str) and t.lower().endswith("code.exe") and os.path.isfile(t):
+                return t
+            # Jika target adalah app id/perintah, coba resolve via which.
+            if isinstance(t, str):
+                found = shutil.which(t)
+                if found:
+                    base = os.path.dirname(os.path.dirname(found))
+                    exe = os.path.join(base, "Code.exe")
+                    if os.path.isfile(exe):
+                        return exe
 
     found = shutil.which("code")
     if found:
@@ -295,7 +662,7 @@ def open_in_vscode(path):
 
 
 def open_terminal(target="vscode"):
-    key = re.sub(r"\s+", " ", str(target or "").strip().lower())
+    key = _normalize(target)
 
     if key in ("vscode", "vs code", "code", "visual studio code"):
         if not _find_window("Visual Studio Code"):
@@ -312,23 +679,102 @@ def open_terminal(target="vscode"):
         keyboard.press_key("ctrl+shift+`")
         return "terminal VS Code"
 
-    if key in ("cmd", "command prompt", "command"):
-        subprocess.Popen(["cmd.exe"], creationflags=CREATE_NEW_CONSOLE)
-        return "Command Prompt"
+    # Dinamis: cari terminal/aplikasi di map yang tersedia.
+    t = _lookup_app(key)
+    if t is not None:
+        return _launch_target(t)
 
-    if key in ("powershell", "pwsh"):
-        subprocess.Popen(["powershell.exe"], creationflags=CREATE_NEW_CONSOLE)
-        return "PowerShell"
+    launched = _launch([key])
+    return launched
 
-    if key in ("terminal", "windows terminal", "wt"):
-        try:
-            os.startfile("wt.exe")  # type: ignore[attr-defined]
-            return "Windows Terminal"
-        except OSError:
-            subprocess.Popen(["cmd.exe"], creationflags=CREATE_NEW_CONSOLE)
-            return "Command Prompt"
 
-    raise DesktopError(f"terminal '{target}' tidak dikenal")
+# (dihapus: gunakan browser_open/search manual agar interaktif)
+
+
+# (dihapus: gunakan browser_open/search manual agar interaktif)
+
+
+def _ab_bin():
+    found = shutil.which("agent-browser")
+    if found:
+        return found
+    # Windows: agent-browser.cmd
+    found = shutil.which("agent-browser.cmd")
+    if found:
+        return found
+    return None
+
+
+def _run_ab(args):
+    bin_path = _ab_bin()
+    if not bin_path:
+        raise DesktopError("agent-browser tidak terpasang")
+    try:
+        result = subprocess.run(
+            [bin_path] + list(args),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if result.returncode != 0 and not out:
+            raise DesktopError(err or "agent-browser gagal")
+        return out if out else (err or "ok")
+    except subprocess.TimeoutExpired:
+        raise DesktopError("agent-browser timeout")
+    except Exception as e:
+        raise DesktopError(f"agent-browser error: {e}")
+
+
+def browser_open(url):
+    target = str(url or "").strip()
+    if not target.lower().startswith(("http://", "https://")):
+        raise DesktopError("hanya URL http/https yang diizinkan")
+    return _run_ab(["open", target])
+
+
+def browser_snapshot(interactive=True):
+    args = ["snapshot"]
+    if interactive:
+        args.append("-i")
+    return _run_ab(args)
+
+
+def browser_click(ref):
+    r = str(ref or "").strip()
+    if not r:
+        raise DesktopError("ref/selector kosong")
+    return _run_ab(["click", r])
+
+
+def browser_type(ref, text):
+    r = str(ref or "").strip()
+    if not r:
+        raise DesktopError("ref kosong")
+    return _run_ab(["fill", r, str(text or "")])
+
+
+def browser_press(key):
+    k = str(key or "").strip()
+    if not k:
+        raise DesktopError("tombol kosong")
+    return _run_ab(["press", k])
+
+
+def browser_scroll(direction, amount=None):
+    d = str(direction or "").strip().lower()
+    if d not in ("up", "down", "left", "right"):
+        raise DesktopError("arah scroll tidak valid")
+    args = ["scroll", d]
+    if amount is not None:
+        args.append(str(amount))
+    return _run_ab(args)
+
+
+def browser_close():
+    return _run_ab(["close"])
 
 
 def wait(ms):
@@ -339,3 +785,15 @@ def wait(ms):
     value = max(100, min(3000, value))
     time.sleep(value / 1000.0)
     return value
+
+
+# Bangun mapping dinamis saat modul dimuat (simpan ke JSON).
+try:
+    refresh_app_map()
+except Exception:
+    # Fallback: coba muat dari cache JSON yang ada.
+    try:
+        with open(APPS_MAP_PATH, encoding="utf-8") as f:
+            _dynamic_apps = json.load(f)
+    except Exception:
+        _dynamic_apps = {}
