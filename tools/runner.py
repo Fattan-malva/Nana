@@ -4,7 +4,8 @@ import json
 import os
 import re
 
-from . import desktop, keyboard, safety, shell
+from . import desktop, keyboard, safety, shell, observation, interaction, verification
+from core.task_engine import request_cancel, is_cancelled, reset_cancel
 from .registry import TOOLS, system_prompt  # noqa: F401 (dipakai app.py)
 
 
@@ -89,6 +90,101 @@ def _call(name, args):
         titles = [w["title"] for w in windows][:30]
         return "\n".join(titles) if titles else "(tidak ada jendela)"
 
+    if name == "observe_active":
+        info = observation.active_window()
+        return json.dumps(info, ensure_ascii=False)
+
+    if name == "ui_controls":
+        title = _text(args, "title", required=False) or None
+        info = observation.control_tree(title)
+        # ringkas agar tidak terlalu panjang
+        controls = info.get("controls", [])[:40]
+        return json.dumps({"window": info.get("window"), "controls": controls}, ensure_ascii=False)
+
+    if name == "ui_click":
+        window = _text(args, "window", required=False) or None
+        namev = _text(args, "name", required=False) or None
+        auto_id = _text(args, "auto_id", required=False) or None
+        res = interaction.click_control(window, namev, auto_id)
+        return res.get("message", "ok")
+
+    if name == "ui_type":
+        window = _text(args, "window", required=False) or None
+        namev = _text(args, "name", required=False) or None
+        auto_id = _text(args, "auto_id", required=False) or None
+        text = _text(args, "text")
+        res = interaction.type_control(window, namev, auto_id, text)
+        return res.get("message", "ok")
+
+    if name == "ui_scroll":
+        direction = _text(args, "direction", required=False) or "down"
+        res = interaction.scroll(direction)
+        return res.get("message", "ok")
+
+    if name == "mouse_click":
+        x = args.get("x")
+        y = args.get("y")
+        res = interaction.click_at(x, y)
+        return res.get("message", "ok")
+
+    if name == "wait_for_control":
+        window = _text(args, "window", required=False) or None
+        namev = _text(args, "name", required=False) or None
+        auto_id = _text(args, "auto_id", required=False) or None
+        timeout = args.get("timeout", 8)
+        res = interaction.wait_for_control(window, namev, auto_id, timeout)
+        return res.get("message", "ok")
+
+    if name == "dismiss_dialog":
+        res = interaction.dismiss_dialog()
+        return res.get("message", "ok")
+
+    if name == "verify_window":
+        title = _text(args, "title")
+        res = verification.verify_window(title)
+        return res.get("message", "ok") + (" " + str(res.get("matches")) if res.get("matches") else "")
+
+    if name == "verify_file":
+        path = _text(args, "path")
+        res = verification.verify_file(path)
+        return res.get("message", "ok")
+
+    if name == "verify_process":
+        namev = _text(args, "name")
+        res = verification.verify_process(namev)
+        return res.get("message", "ok")
+
+    if name == "cancel_task":
+        request_cancel()
+        return "Pembatalan diminta"
+
+    if name == "volume_up":
+        steps = args.get("steps", 1)
+        return desktop.volume_up(steps)
+
+    if name == "volume_down":
+        steps = args.get("steps", 1)
+        return desktop.volume_down(steps)
+
+    if name == "volume_mute":
+        return desktop.volume_mute()
+
+    if name == "close_tab":
+        title = _text(args, "title", required=False) or None
+        count = args.get("count", 1)
+        closed = desktop.close_tab(title, count)
+        return f"Tab ditutup: {closed}"
+
+    if name == "close_browser":
+        title = _text(args, "title", required=False) or None
+        closed = desktop.close_browser(title)
+        return f"Browser ditutup: {closed}"
+
+    if name == "search_web":
+        query = _text(args, "query")
+        url = desktop.search_web(query)
+        return f"Hasil dibuka: {url}"
+
     if name == "wait":
         value = desktop.wait(args.get("ms", 500))
         return f"Menunggu {value} ms"
@@ -112,15 +208,16 @@ def run(tool, args):
 
     try:
         result = _call(name, payload)
-        outcome = {"ok": True, "blocked": False, "message": result}
+        outcome = {"ok": True, "blocked": False, "status": "success", "message": result}
     except safety.SafetyError as e:
-        outcome = {"ok": False, "blocked": True, "message": str(e)}
+        outcome = {"ok": False, "blocked": True, "status": "blocked", "message": str(e)}
     except (desktop.DesktopError, keyboard.InputError, shell.ShellError, ToolError) as e:
-        outcome = {"ok": False, "blocked": False, "message": str(e)}
+        outcome = {"ok": False, "blocked": False, "status": "failed", "message": str(e)}
     except Exception as e:
         outcome = {
             "ok": False,
             "blocked": False,
+            "status": "failed",
             "message": f"{type(e).__name__}: {e}",
         }
 
@@ -155,6 +252,42 @@ def status(tool, args):
         return "app", "Membuka di VS Code"
     if name == "list_windows":
         return "list", "Melihat daftar jendela"
+    if name == "observe_active":
+        return "list", "Mengamati window aktif"
+    if name == "ui_controls":
+        return "list", "Membaca kontrol UI"
+    if name == "ui_click":
+        return "app", "Mengklik kontrol UI"
+    if name == "ui_type":
+        return "keyboard", "Mengisi kontrol UI"
+    if name == "ui_scroll":
+        return "list", f"Scroll {arg('direction', 'down')}"
+    if name == "mouse_click":
+        return "app", "Klik mouse"
+    if name == "wait_for_control":
+        return "list", "Menunggu kontrol"
+    if name == "dismiss_dialog":
+        return "app", "Menutup dialog"
+    if name == "verify_window":
+        return "list", "Memverifikasi window"
+    if name == "verify_file":
+        return "folder", "Memverifikasi file"
+    if name == "verify_process":
+        return "app", "Memverifikasi proses"
+    if name == "cancel_task":
+        return "blocked", "Membatalkan tugas"
+    if name == "volume_up":
+        return "key", "Volume naik"
+    if name == "volume_down":
+        return "key", "Volume turun"
+    if name == "volume_mute":
+        return "key", "Mute volume"
+    if name == "close_tab":
+        return "app", "Menutup tab"
+    if name == "close_browser":
+        return "app", "Menutup browser"
+    if name == "search_web":
+        return "globe", f"Mencari: {arg('query', '')[:40]}"
     if name == "wait":
         return "timer", "Menunggu sebentar"
     return "app", name or "Aksi"

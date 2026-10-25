@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from tools import runner  # noqa: E402  (setelah .env dimuat)
+from core.task_engine import TaskEngine, is_cancelled, reset_cancel  # noqa: E402
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ollama.com/v1/chat/completions")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
@@ -867,6 +868,8 @@ class Api:
         self._last_activity = time.time()
         self._prev_xy = None
         self._history = []
+        self._task_engine = TaskEngine()
+        self._current_task = None
         # True setelah terminal VS Code dibuka pada request yang sama:
         # type_text diblokir supaya perintah tidak "nyasar" ke terminal.
         self._terminal_guard = False
@@ -1051,6 +1054,21 @@ class Api:
                     time.sleep(0.8)
                     continue
 
+                low = text.lower()
+                if "batalkan" in low or "cancel" in low or "batal" in low:
+                    reset_cancel()
+                    from core.task_engine import request_cancel as _rc
+                    _rc()
+                    if self._current_task is not None:
+                        self._current_task.status = "cancelled"
+                    self._js("window.startAnswer()")
+                    self._emit("Tugas dibatalkan.")
+                    self._js("window.endAnswer()")
+                    self._wait_idle()
+                    self._last_activity = time.time()
+                    time.sleep(1.0)
+                    continue
+
                 self._js("window.startAnswer()")
                 ok = self._stream_llm(text)
                 if not ok:
@@ -1189,22 +1207,24 @@ class Api:
             print(f"[wav] {e}")
             return ""
 
-        try:
-            r = sr.Recognizer()
-            with sr.AudioFile("temp.wav") as source:
-                audio = r.record(source)
+        for attempt in range(2):
             try:
-                return r.recognize_google(audio, language="id-ID")
-            except Exception as e1:
-                print(f"[stt id] {e1}")
+                r = sr.Recognizer()
+                with sr.AudioFile("temp.wav") as source:
+                    audio = r.record(source)
                 try:
-                    return r.recognize_google(audio)
-                except Exception as e2:
-                    print(f"[stt] {e2}")
-                    return ""
-        except Exception as e:
-            print(f"[sr] {e}")
-            return ""
+                    return r.recognize_google(audio, language="id-ID")
+                except Exception as e1:
+                    print(f"[stt id] {e1}")
+                    try:
+                        return r.recognize_google(audio)
+                    except Exception as e2:
+                        print(f"[stt] {e2}")
+            except Exception as e:
+                print(f"[sr] {e}")
+            if attempt == 0:
+                time.sleep(0.5)
+        return ""
 
     # ---------------- Streaming LLM + tools ----------------
     def _emit(self, text):
@@ -1372,8 +1392,19 @@ class Api:
         emitted_any = False
         final_text = ""
         self._terminal_guard = False
+        reset_cancel()
+        self._current_task = self._task_engine.create(message)
+        self._task_engine.set_plan(self._current_task.task_id, [])
 
         for step in range(TOOLS_MAX_STEPS + 1):
+            if is_cancelled():
+                msg = "Tugas dibatalkan."
+                self._emit(msg)
+                emitted_any = True
+                final_text += msg
+                if self._current_task is not None:
+                    self._current_task.status = "cancelled"
+                break
             emitted, action = self._llm_round(messages)
             if emitted:
                 emitted_any = True
@@ -1424,6 +1455,12 @@ class Api:
             ):
                 self._terminal_guard = True
 
+            if self._current_task is not None:
+                if result.get("ok"):
+                    self._task_engine.complete_step(self._current_task.task_id, result)
+                else:
+                    self._task_engine.fail(self._current_task.task_id, result)
+
             done_label = "Selesai"
             if not result.get("ok"):
                 done_label = "Diblokir" if result.get("blocked") else "Gagal"
@@ -1453,6 +1490,9 @@ class Api:
             self._emit(msg)
             final_text = msg
             emitted_any = True
+
+        if self._current_task is not None and self._current_task.status not in ("failed", "cancelled"):
+            self._current_task.status = "completed" if emitted_any else "failed"
 
         self._history.append({"role": "user", "content": message})
         self._history.append({"role": "assistant", "content": final_text})

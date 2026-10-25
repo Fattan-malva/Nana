@@ -3,3 +3,6 @@ numpy==2.2.6
 httpx==0.27.0
 python-dotenv==1.0.1
 SpeechRecognition==3.14.3
+psutil==7.2.2
+pywinauto==0.6.9
+comtypes==1.4.17

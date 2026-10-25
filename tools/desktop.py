@@ -235,6 +235,16 @@ def focus_window(title):
 
     ok = _focus_handle(win["hwnd"])
     if not ok:
+        # Fallback via pywinauto (lebih andal).
+        try:
+            from pywinauto import Desktop as _PwDesktop
+            pw = _PwDesktop(backend="uia").window(handle=win["hwnd"])
+            pw.set_focus()
+            time.sleep(0.2)
+            ok = True
+        except Exception:
+            ok = False
+    if not ok:
         raise DesktopError(f"gagal fokus ke '{win['title']}' (diblokir Windows)")
     return win["title"]
 
@@ -593,6 +603,85 @@ def close_window(title):
     return win["title"]
 
 
+def close_tab(title=None, count=1):
+    needle = str(title or "").strip().lower()
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(20, count))
+
+    closed = []
+    for i in range(count):
+        browser_wins = []
+        for w in list_windows():
+            t = w["title"].lower()
+            if any(b in t for b in ("chrome", "edge", "firefox", "brave", "opera")):
+                browser_wins.append(w)
+
+        target_win = None
+        if needle and i == 0:
+            for w in browser_wins:
+                if needle in w["title"].lower():
+                    target_win = w
+                    break
+        if target_win is None and browser_wins:
+            target_win = browser_wins[0]
+        if target_win is None:
+            raise DesktopError("window browser tidak ditemukan")
+
+        try:
+            from pywinauto import Desktop as _PwDesktop
+            pw = _PwDesktop(backend="uia").window(handle=target_win["hwnd"])
+            pw.set_focus()
+            time.sleep(0.25)
+            if i == 0 and needle:
+                tabs = [t for t in pw.descendants() if getattr(t.element_info, "control_type", "") == "TabItem"]
+                for t in tabs:
+                    if needle in (t.window_text() or "").lower():
+                        try:
+                            t.select()
+                        except Exception:
+                            try:
+                                t.click_input()
+                            except Exception:
+                                pass
+                        time.sleep(0.4)
+                        break
+            try:
+                pw.set_focus()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                focus_window(target_win["title"])
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+        time.sleep(0.15)
+        keyboard.press_key("ctrl+w")
+        closed.append(target_win["title"])
+        time.sleep(0.8)
+
+    return ", ".join(closed)
+
+def close_browser(title=None):
+    needle = str(title or "").strip()
+    win = None
+    if needle:
+        win = _find_window(needle)
+    if not win:
+        for cand in ("Google Chrome", "Chrome", "Microsoft Edge", "Edge", "Mozilla Firefox", "Firefox"):
+            win = _find_window(cand)
+            if win:
+                break
+    if not win:
+        raise DesktopError("window browser tidak ditemukan")
+    user32.PostMessageW(win["hwnd"], WM_CLOSE, 0, 0)
+    return win["title"]
+
+
 def close_app(name):
     key = _normalize(name)
     if not key:
@@ -775,6 +864,90 @@ def browser_scroll(direction, amount=None):
 
 def browser_close():
     return _run_ab(["close"])
+
+
+def search_web(query):
+    """Cari di web dan buka hasil pertama (generik, dinamis via Google I'm Feeling Lucky)."""
+    q = str(query or "").strip()
+    if not q:
+        raise DesktopError("query kosong")
+    lucky = "https://www.google.com/search?q=%s&btnI=1" % urllib.parse.quote(q)
+    target = lucky
+    try:
+        req = urllib.request.Request(lucky, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            final = resp.geturl()
+            html = resp.read().decode("utf-8", errors="ignore")
+        if final and "google.com/url" in final:
+            m = re.search(r"https?://(?!www\.google\.com)[^\s\"<>]+", html)
+            if m:
+                target = m.group(0)
+        elif "Redirect Notice" in html or "Notifikasi Pengalihan" in html:
+            m = re.search(r"https?://(?!www\.google\.com)[^\s\"<>]+", html)
+            if m:
+                target = m.group(0)
+        else:
+            target = final or lucky
+    except Exception:
+        target = lucky
+    # Reuse tab browser yang sudah terbuka jika ada, agar tidak menambah tab baru.
+    browser_win = None
+    for w in list_windows():
+        t = w["title"].lower()
+        if any(b in t for b in ("chrome", "edge", "firefox", "brave", "opera")):
+            browser_win = w
+            break
+    if browser_win is not None:
+        try:
+            from pywinauto import Desktop as _PwDesktop
+            pw = _PwDesktop(backend="uia").window(handle=browser_win["hwnd"])
+            pw.set_focus()
+            time.sleep(0.3)
+            keyboard.press_key("ctrl+l")
+            time.sleep(0.2)
+            keyboard.type_text(target)
+            time.sleep(0.1)
+            keyboard.press_key("enter")
+            return target
+        except Exception:
+            pass
+    open_url(target)
+    return target
+
+
+def volume_up(steps=1):
+    for _ in range(max(1, int(steps))):
+        user32.keybd_event(0xAF, 0, 0, 0)
+        user32.keybd_event(0xAF, 0, 2, 0)
+        time.sleep(0.05)
+    return "volume up"
+
+
+def volume_down(steps=1):
+    for _ in range(max(1, int(steps))):
+        user32.keybd_event(0xAE, 0, 0, 0)
+        user32.keybd_event(0xAE, 0, 2, 0)
+        time.sleep(0.05)
+    return "volume down"
+
+
+def volume_mute():
+    user32.keybd_event(0xAD, 0, 0, 0)
+    user32.keybd_event(0xAD, 0, 2, 0)
+    return "mute toggled"
+
+
+def wait_for_window(title, timeout=8.0):
+    needle = str(title or "").strip()
+    if not needle:
+        raise DesktopError("judul window kosong")
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        win = _find_window(needle)
+        if win:
+            return win["title"]
+        time.sleep(0.3)
+    raise DesktopError(f"window '{needle}' tidak muncul dalam {timeout}s")
 
 
 def wait(ms):
